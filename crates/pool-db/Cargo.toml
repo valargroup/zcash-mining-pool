@@ -1,0 +1,12 @@
+[package]
+name = "pool-db"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+sqlx.workspace = true

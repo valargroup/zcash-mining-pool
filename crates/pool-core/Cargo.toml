@@ -1,0 +1,21 @@
+[package]
+name = "pool-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+blake2b_simd.workspace = true
+chrono.workspace = true
+rand.workspace = true
+node-rpc = { path = "../node-rpc" }
+stratum = { path = "../stratum" }
+pool-db = { path = "../pool-db" }
+rewards = { path = "../rewards" }
+equihash = "0.2"
+sha2 = "0.10"

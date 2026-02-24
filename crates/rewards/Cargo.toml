@@ -1,0 +1,13 @@
+[package]
+name = "rewards"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+pool-db = { path = "../pool-db" }
+sqlx.workspace = true

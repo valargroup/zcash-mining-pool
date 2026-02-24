@@ -1,0 +1,16 @@
+[package]
+name = "stratum"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio.workspace = true
+tokio-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+rand.workspace = true
+futures.workspace = true
+bytes = "1"

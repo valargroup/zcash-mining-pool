@@ -1,0 +1,719 @@
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::{Html, Json};
+use chrono::TimeZone;
+use node_rpc::ZcashRpcClient;
+use serde::Serialize;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+use pool_db::PoolDb;
+
+pub type AppState = Arc<ApiState>;
+
+/// If no template received in this many ms, the pool is considered stalled.
+const STALL_THRESHOLD_MS: i64 = 90_000;
+
+/// Zcash target block interval.
+const BLOCK_TIME_SECS: f64 = 75.0;
+
+pub struct ApiState {
+    pub db: PoolDb,
+    pub rpc: Arc<ZcashRpcClient>,
+    pub pool_name: String,
+    pub pool_fee: f64,
+    pub stratum_port: u16,
+    /// Unix timestamp (ms) of last successful getblocktemplate. Used for stall detection.
+    pub last_template_at_ms: Option<Arc<std::sync::atomic::AtomicI64>>,
+    /// Wallet RPC client (Zallet) for balance/health check. Pool communicates with Zallet only via RPC.
+    pub wallet_rpc: Option<Arc<ZcashRpcClient>>,
+    /// Pool payout address (unified address for z_sendmany).
+    pub pool_address: Option<String>,
+    /// Mining address (transparent, for shielding).
+    pub mining_address: Option<String>,
+    /// Minimum payout in zatoshis.
+    pub min_payout_zatoshis: i64,
+    /// Maturity confirmations required.
+    pub maturity_confirmations: u64,
+    /// Difficulty multiplier: converts shares/sec to Sol/s.
+    /// Equal to 2^256 / share_target. For target 0800...0000 this is 32.
+    pub difficulty_multiplier: f64,
+}
+
+#[derive(Serialize)]
+pub struct PoolStats {
+    pub name: String,
+    pub fee_percent: f64,
+    pub stratum_port: u16,
+    pub connected_miners: i64,
+    pub total_blocks: i64,
+    pub immature_blocks: i64,
+    pub pending_payout_blocks: i64,
+    pub total_shares: i64,
+    pub hashrate_estimate: f64,
+    pub network_hashrate: f64,
+    /// Pool luck over the last 24h as a percentage (100 = exactly as expected).
+    pub luck_percent: Option<f64>,
+    pub node_ok: bool,
+    pub last_template_at: Option<String>,
+    pub wallet_ok: bool,
+}
+
+#[derive(Serialize)]
+pub struct MinerStats {
+    pub address: String,
+    pub balance: MinerBalance,
+    pub workers: Vec<WorkerInfo>,
+}
+
+#[derive(Serialize)]
+pub struct MinerBalance {
+    pub pending_zatoshis: i64,
+    pub paid_zatoshis: i64,
+    pub pending_zec: f64,
+    pub paid_zec: f64,
+}
+
+#[derive(Serialize)]
+pub struct WorkerInfo {
+    pub name: String,
+    pub last_seen: String,
+}
+
+#[derive(Serialize)]
+pub struct BlockInfo {
+    pub height: i64,
+    pub hash: String,
+    pub reward_zatoshis: i64,
+    pub reward_zec: f64,
+    pub status: String,
+    pub found_at: String,
+    pub luck_percent: Option<f64>,
+}
+
+#[derive(Serialize)]
+pub struct PayoutInfo {
+    pub miner_id: i64,
+    pub miner_address: String,
+    pub txid: Option<String>,
+    pub amount_zatoshis: i64,
+    pub amount_zec: f64,
+    pub created_at: String,
+}
+
+#[derive(Serialize)]
+pub struct MinerListInfo {
+    pub address: String,
+    pub pending_zec: f64,
+    pub share_count: i64,
+    pub worker_count: i64,
+    pub hashrate: f64,
+    pub hashrate_1m: f64,
+    pub joined: String,
+}
+
+#[derive(Serialize)]
+pub struct ApiError {
+    pub error: String,
+}
+
+const ZATOSHIS_PER_ZEC: f64 = 100_000_000.0;
+
+pub async fn get_pool_stats(
+    State(state): State<AppState>,
+) -> Result<Json<PoolStats>, StatusCode> {
+    let connected = state.db.get_connected_miners_count().await.unwrap_or(0);
+    let blocks = state.db.get_blocks_count().await.unwrap_or(0);
+    let immature = state.db.get_immature_blocks_count().await.unwrap_or(0);
+    let pending_payout = state.db.get_pending_payout_blocks_count().await.unwrap_or(0);
+    let shares = state.db.get_total_shares_count().await.unwrap_or(0);
+
+    // Pool hashrate: difficulty_sum / time × difficulty_multiplier = Sol/s.
+    // Uses SUM(difficulty) instead of COUNT(*) to account for vardiff.
+    let since_10m = chrono::Utc::now()
+        .checked_sub_signed(chrono::Duration::minutes(10))
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_default();
+    let diff_sum_10m = state
+        .db
+        .get_difficulty_sum_since(&since_10m)
+        .await
+        .unwrap_or(0.0);
+    let hashrate = (diff_sum_10m / 600.0) * state.difficulty_multiplier;
+
+    let (node_ok, last_template_at) = match &state.last_template_at_ms {
+        None => (true, None),
+        Some(at) => {
+            let ms = at.load(Ordering::Relaxed);
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let age_ms = now_ms - ms;
+            let ok = ms > 0 && age_ms < STALL_THRESHOLD_MS;
+            let ts = if ms > 0 {
+                chrono::Utc.timestamp_millis_opt(ms)
+                    .single()
+                    .map(|dt| dt.to_rfc3339())
+            } else {
+                None
+            };
+            (ok, ts)
+        }
+    };
+
+    let network_hashrate = state
+        .rpc
+        .get_network_sol_ps(Some(120))
+        .await
+        .unwrap_or(0.0);
+
+    // Luck (effort) over the last 24h: expected_blocks / actual_blocks * 100.
+    // <100% = lucky (found blocks faster than expected), >100% = unlucky.
+    let luck_percent = if network_hashrate > 0.0 && hashrate > 0.0 {
+        let window_secs = 24.0 * 3600.0;
+        let since_24h = chrono::Utc::now()
+            .checked_sub_signed(chrono::Duration::hours(24))
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_default();
+        let actual_blocks = state
+            .db
+            .get_blocks_count_since(&since_24h)
+            .await
+            .unwrap_or(0) as f64;
+        let expected_blocks = (hashrate / network_hashrate) * (window_secs / BLOCK_TIME_SECS);
+        if actual_blocks > 0.0 {
+            Some((expected_blocks / actual_blocks) * 100.0)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Ok(Json(PoolStats {
+        name: state.pool_name.clone(),
+        fee_percent: state.pool_fee,
+        stratum_port: state.stratum_port,
+        connected_miners: connected,
+        total_blocks: blocks,
+        immature_blocks: immature,
+        pending_payout_blocks: pending_payout,
+        total_shares: shares,
+        hashrate_estimate: hashrate,
+        network_hashrate,
+        luck_percent,
+        node_ok,
+        last_template_at,
+        wallet_ok: check_wallet_rpc(&state).await,
+    }))
+}
+
+async fn check_wallet_rpc(state: &ApiState) -> bool {
+    match &state.wallet_rpc {
+        Some(rpc) => {
+            // Use z_gettotalbalance as a lightweight health check -- it's wallet-specific
+            // and confirms Zallet is running and responsive.
+            let result: Result<serde_json::Value, _> = rpc.call_raw(
+                "z_gettotalbalance", serde_json::json!([0, true])
+            ).await;
+            result.is_ok()
+        }
+        None => false,
+    }
+}
+
+/// Health check: 200 if node is returning templates recently, 503 if stalled.
+pub async fn get_health(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    let (ok, reason) = match &state.last_template_at_ms {
+        None => (true, "stall tracking not configured"),
+        Some(at) => {
+            let ms = at.load(Ordering::Relaxed);
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let age_ms = now_ms - ms;
+            if ms == 0 {
+                (false, "no template received yet")
+            } else if age_ms >= STALL_THRESHOLD_MS {
+                (false, "node has not returned a block template recently; pool may be stalled")
+            } else {
+                (true, "ok")
+            }
+        }
+    };
+    let status = if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    let body = serde_json::json!({
+        "status": if ok { "ok" } else { "stalled" },
+        "node_ok": ok,
+        "reason": reason
+    });
+    (status, Json(body))
+}
+
+const ZATOSHIS_PER_ZEC_F64: f64 = 100_000_000.0;
+
+fn reverse_hex(hex_str: &str) -> String {
+    let bytes = hex::decode(hex_str).unwrap_or_default();
+    let reversed: Vec<u8> = bytes.into_iter().rev().collect();
+    hex::encode(reversed)
+}
+
+pub async fn trigger_payout(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let wallet_rpc = match &state.wallet_rpc {
+        Some(rpc) => rpc,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+            "status": "error", "message": "Wallet RPC not configured"
+        }))),
+    };
+    let pool_address = match &state.pool_address {
+        Some(a) => a.clone(),
+        None => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+            "status": "error", "message": "Pool address not configured"
+        }))),
+    };
+
+    // Phase 1: Check block maturity
+    let current_height = match state.rpc.get_block_count().await {
+        Ok(h) => h,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "status": "error", "message": format!("getblockcount failed: {e}")
+        }))),
+    };
+
+    let mut confirmed = 0i64;
+    let mut orphaned = 0i64;
+    if let Ok(pending_blocks) = state.db.get_pending_blocks().await {
+        for block in &pending_blocks {
+            let confs = current_height as i64 - block.height;
+            if confs < state.maturity_confirmations as i64 { continue; }
+            match state.rpc.get_block_hash(block.height as u64).await {
+                Ok(chain_hash) => {
+                    let pool_hash_reversed = reverse_hex(&block.hash);
+                    if chain_hash == pool_hash_reversed || chain_hash == block.hash {
+                        let _ = state.db.update_block_status(block.id, "confirmed").await;
+                        confirmed += 1;
+                    } else {
+                        let _ = state.db.update_block_status(block.id, "orphaned").await;
+                        let _ = state.db.reverse_block_credits(block.reward).await;
+                        orphaned += 1;
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    // Phase 2: Shield coinbase (if mining_address differs from pool_address)
+    let mut shielded = false;
+    if let Some(ref mining_addr) = state.mining_address {
+        if *mining_addr != pool_address {
+            match wallet_rpc.z_shield_coinbase(mining_addr, &pool_address, None).await {
+                Ok(result) => {
+                    let utxos = result.get("shieldingUTXOs").and_then(|v| v.as_u64()).unwrap_or(0);
+                    if utxos > 0 {
+                        let opid = result.get("opid").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                        tracing::info!(opid = %opid, utxos = utxos, "Shielding triggered, waiting for 3 confirmations");
+                        shielded = true;
+
+                        // Wait for the shielding operation to complete
+                        let shield_ok = loop {
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            match wallet_rpc.z_get_operation_status(&[&opid]).await {
+                                Ok(statuses) => {
+                                    if let Some(s) = statuses.first() {
+                                        match s.get("status").and_then(|v| v.as_str()).unwrap_or("") {
+                                            "success" => break true,
+                                            "failed" => {
+                                                tracing::error!("Shielding operation failed");
+                                                break false;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                Err(_) => break false,
+                            }
+                        };
+
+                        // Wait for 3 confirmations (~30-45s on testnet)
+                        if shield_ok {
+                            tracing::info!("Shielding complete, waiting for 3 confirmations");
+                            for _ in 0..60 {
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                match wallet_rpc.call_raw::<serde_json::Value>(
+                                    "z_gettotalbalance", serde_json::json!([3, true])
+                                ).await {
+                                    Ok(bal) => {
+                                        let private = bal.get("private")
+                                            .and_then(|v| v.as_str())
+                                            .and_then(|s| s.parse::<f64>().ok())
+                                            .unwrap_or(0.0);
+                                        if private > 0.0 {
+                                            tracing::info!(balance = private, "Shielded funds confirmed (3+ confs)");
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    // Phase 3: Process payouts
+    let pending = match state.db.get_pending_payouts(state.min_payout_zatoshis).await {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "status": "error", "message": format!("DB error: {e}")
+        }))),
+    };
+
+    if pending.is_empty() {
+        return (StatusCode::OK, Json(serde_json::json!({
+            "status": "ok",
+            "message": "No miners eligible for payout",
+            "blocks_confirmed": confirmed,
+            "blocks_orphaned": orphaned,
+            "shielding_triggered": shielded,
+            "payouts": 0
+        })));
+    }
+
+    let amounts: Vec<(&str, f64)> = pending
+        .iter()
+        .map(|p| (p.address.as_str(), p.amount as f64 / ZATOSHIS_PER_ZEC_F64))
+        .collect();
+
+    let opid = match wallet_rpc.z_sendmany(&pool_address, &amounts).await {
+        Ok(id) => id,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "status": "error",
+            "message": format!("z_sendmany failed: {e}"),
+            "blocks_confirmed": confirmed,
+            "blocks_orphaned": orphaned,
+        }))),
+    };
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "status": "ok",
+        "message": "Payout submitted",
+        "opid": opid,
+        "miners": pending.len(),
+        "total_zec": pending.iter().map(|p| p.amount).sum::<i64>() as f64 / ZATOSHIS_PER_ZEC_F64,
+        "blocks_confirmed": confirmed,
+        "blocks_orphaned": orphaned,
+        "shielding_triggered": shielded,
+    })))
+}
+
+pub async fn get_miner_stats(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+) -> Result<Json<MinerStats>, (StatusCode, Json<ApiError>)> {
+    let miner = state
+        .db
+        .get_miner_by_address(&address)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: "Database error".to_string(),
+                }),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiError {
+                    error: "Miner not found".to_string(),
+                }),
+            )
+        })?;
+
+    let balance = state
+        .db
+        .get_or_create_balance(miner.id)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: "Database error".to_string(),
+                }),
+            )
+        })?;
+
+    let workers = state
+        .db
+        .get_workers_for_miner(miner.id)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: "Database error".to_string(),
+                }),
+            )
+        })?;
+
+    Ok(Json(MinerStats {
+        address: miner.address,
+        balance: MinerBalance {
+            pending_zatoshis: balance.pending,
+            paid_zatoshis: balance.paid,
+            pending_zec: balance.pending as f64 / ZATOSHIS_PER_ZEC,
+            paid_zec: balance.paid as f64 / ZATOSHIS_PER_ZEC,
+        },
+        workers: workers
+            .into_iter()
+            .map(|w| WorkerInfo {
+                name: w.name,
+                last_seen: w.last_seen,
+            })
+            .collect(),
+    }))
+}
+
+pub async fn get_blocks(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<BlockInfo>>, StatusCode> {
+    let blocks = state
+        .db
+        .get_recent_blocks(150)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let network_hashrate = state
+        .rpc
+        .get_network_sol_ps(Some(120))
+        .await
+        .unwrap_or(0.0);
+
+    // Per-block luck (effort): actual_work / expected_work * 100.
+    // <100% = lucky (found block faster), >100% = unlucky (took more work).
+    // expected_work = network_hashrate * BLOCK_TIME_SECS (total solutions per block interval).
+    // actual_work = SUM(difficulty) * difficulty_multiplier (vardiff-weighted).
+    let expected_work = network_hashrate * BLOCK_TIME_SECS;
+
+    let mut result = Vec::with_capacity(blocks.len());
+    for (i, b) in blocks.iter().enumerate() {
+        let luck_percent = if expected_work > 0.0 {
+            let prev_time = blocks.get(i + 1)
+                .map(|prev| prev.created_at.as_str())
+                .unwrap_or("2000-01-01 00:00:00");
+            let diff_sum = state
+                .db
+                .get_difficulty_sum_between(prev_time, &b.created_at)
+                .await
+                .unwrap_or(0.0);
+            let actual_work = diff_sum * state.difficulty_multiplier;
+            if actual_work > 0.0 {
+                Some((actual_work / expected_work) * 100.0)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        result.push(BlockInfo {
+            height: b.height,
+            hash: b.hash.clone(),
+            reward_zatoshis: b.reward,
+            reward_zec: b.reward as f64 / ZATOSHIS_PER_ZEC,
+            status: b.status.clone(),
+            found_at: b.created_at.clone(),
+            luck_percent,
+        });
+    }
+
+    Ok(Json(result))
+}
+
+pub async fn get_miners(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<MinerListInfo>>, StatusCode> {
+    let miners = state
+        .db
+        .get_all_miners_with_stats()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(
+        miners
+            .into_iter()
+            .map(|m| MinerListInfo {
+                address: m.address,
+                pending_zec: m.pending_balance as f64 / ZATOSHIS_PER_ZEC,
+                share_count: m.share_count,
+                worker_count: m.worker_count,
+                hashrate: (m.recent_diff / 600.0) * state.difficulty_multiplier,
+                hashrate_1m: (m.recent_diff_1m / 60.0) * state.difficulty_multiplier,
+                joined: m.created_at,
+            })
+            .collect(),
+    ))
+}
+
+pub async fn get_payouts(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<PayoutInfo>>, StatusCode> {
+    let payouts = state
+        .db
+        .get_recent_payouts(50)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut result = Vec::with_capacity(payouts.len());
+    for p in payouts {
+        let addr = state
+            .db
+            .get_miner_address(p.miner_id)
+            .await
+            .unwrap_or_else(|_| format!("miner#{}", p.miner_id));
+        result.push(PayoutInfo {
+            miner_id: p.miner_id,
+            miner_address: addr,
+            txid: p.txid,
+            amount_zatoshis: p.amount,
+            amount_zec: p.amount as f64 / ZATOSHIS_PER_ZEC,
+            created_at: p.created_at,
+        });
+    }
+    Ok(Json(result))
+}
+
+// --- Wallet status (RPC only; pool does not manage Zallet process) ---
+
+#[derive(Serialize)]
+pub struct ZalletStatus {
+    pub rpc_ok: bool,
+    pub balance: Option<ZalletBalance>,
+    pub error: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ZalletBalance {
+    pub transparent: String,
+    pub private: String,
+    pub total: String,
+}
+
+pub async fn get_zallet_status(
+    State(state): State<AppState>,
+) -> Result<Json<ZalletStatus>, StatusCode> {
+    let mut status = ZalletStatus {
+        rpc_ok: false,
+        balance: None,
+        error: None,
+    };
+
+    if let Some(ref wallet) = state.wallet_rpc {
+        match wallet.z_get_total_balance().await {
+            Ok(v) => {
+                status.rpc_ok = true;
+                if let Some(obj) = v.as_object() {
+                    status.balance = Some(ZalletBalance {
+                        transparent: obj.get("transparent").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
+                        private: obj.get("private").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
+                        total: obj.get("total").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
+                    });
+                }
+            }
+            Err(e) => status.error = Some(format!("RPC error: {e}")),
+        }
+    } else {
+        status.error = Some("Wallet RPC not configured (payout.wallet_rpc_url)".to_string());
+    }
+
+    Ok(Json(status))
+}
+
+pub async fn zallet_dashboard() -> Html<String> {
+    Html(ZALLET_DASHBOARD_HTML.to_string())
+}
+
+const ZALLET_DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Wallet Status - Zcash Mining Pool</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0e17; color: #e0e0e0; min-height: 100vh; }
+        .header { background: linear-gradient(135deg, #1a1f2e 0%, #0d1117 100%); border-bottom: 1px solid #f4b728; padding: 1.5rem 2rem; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; }
+        .header h1 { color: #f4b728; font-size: 1.5rem; }
+        .header a { color: #718096; text-decoration: none; font-size: 0.9rem; }
+        .header a:hover { color: #f4b728; }
+        .container { max-width: 600px; margin: 0 auto; padding: 2rem; }
+        .card { background: #1a1f2e; border: 1px solid #2d3748; border-radius: 8px; padding: 1.25rem; margin-bottom: 1.5rem; }
+        .card h2 { font-size: 1rem; color: #a0aec0; margin-bottom: 1rem; padding-bottom: 0.5rem; border-bottom: 1px solid #2d3748; }
+        .badge { padding: 0.25rem 0.75rem; border-radius: 4px; font-size: 0.8rem; font-weight: 600; }
+        .badge-ok { background: #22543d; color: #68d391; }
+        .badge-fail { background: #742a2a; color: #fc8181; }
+        .balance-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }
+        .balance-item .label { font-size: 0.7rem; text-transform: uppercase; color: #718096; margin-bottom: 0.25rem; }
+        .balance-item .value { font-size: 1.25rem; color: #f4b728; }
+        .error { color: #fc8181; margin-top: 0.5rem; }
+        .note { font-size: 0.75rem; color: #718096; margin-top: 1rem; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Wallet Status</h1>
+        <a href="/">← Pool Dashboard</a>
+    </div>
+    <div class="container">
+        <div class="card">
+            <h2>RPC Status</h2>
+            <span id="badge-rpc" class="badge badge-fail">–</span>
+            <div id="error" class="error"></div>
+        </div>
+        <div class="card">
+            <h2>Balance</h2>
+            <div class="balance-grid">
+                <div class="balance-item"><div class="label">Transparent</div><div class="value" id="bal-t">–</div></div>
+                <div class="balance-item"><div class="label">Private</div><div class="value" id="bal-p">–</div></div>
+                <div class="balance-item"><div class="label">Total</div><div class="value" id="bal-total">–</div></div>
+            </div>
+            <div class="note">Zallet must be run externally. Pool communicates with it via RPC only.</div>
+        </div>
+    </div>
+    <script>
+        async function fetchStatus() {
+            try {
+                const r = await fetch('/api/zallet/status');
+                const d = await r.json();
+                const rb = document.getElementById('badge-rpc');
+                rb.textContent = d.rpc_ok ? 'Online' : 'Offline';
+                rb.className = 'badge ' + (d.rpc_ok ? 'badge-ok' : 'badge-fail');
+                if (d.balance) {
+                    document.getElementById('bal-t').textContent = d.balance.transparent + ' ZEC';
+                    document.getElementById('bal-p').textContent = d.balance.private + ' ZEC';
+                    document.getElementById('bal-total').textContent = d.balance.total + ' ZEC';
+                } else {
+                    document.getElementById('bal-t').textContent = '–';
+                    document.getElementById('bal-p').textContent = '–';
+                    document.getElementById('bal-total').textContent = '–';
+                }
+                document.getElementById('error').textContent = d.error || '';
+            } catch (e) {
+                document.getElementById('badge-rpc').textContent = 'Error';
+                document.getElementById('badge-rpc').className = 'badge badge-fail';
+                document.getElementById('error').textContent = 'Failed to fetch: ' + e;
+            }
+        }
+        fetchStatus();
+        setInterval(fetchStatus, 5000);
+    </script>
+</body>
+</html>
+"##;

@@ -1,0 +1,594 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use pool_db::PoolDb;
+use sha2::{Digest, Sha256};
+use stratum::messages::StratumError;
+use stratum::server::{StratumEvent, StratumServer};
+use stratum::ServerMessage;
+use tokio::sync::{mpsc, RwLock};
+use tracing::{debug, error, info, warn};
+
+use crate::block::BlockAssembler;
+use crate::difficulty::{difficulty_to_target_hex, VardiffTracker};
+use crate::job::MiningJob;
+use rewards::PplnsCalculator;
+
+const RAW_SOLUTION_SIZE: usize = 1344; // Equihash(200,9)
+
+/// Configuration for variable difficulty.
+#[derive(Debug, Clone)]
+pub struct VardiffConfig {
+    pub initial_difficulty: f64,
+    pub target_shares_per_minute: f64,
+    pub retarget_interval_secs: f64,
+}
+
+/// Per-session state: vardiff tracker + current target.
+struct SessionDifficulty {
+    vardiff: VardiffTracker,
+    target: [u8; 32],
+}
+
+pub struct ShareValidator {
+    db: PoolDb,
+    stratum: Arc<StratumServer>,
+    jobs: Arc<RwLock<HashMap<String, MiningJob>>>,
+    block_assembler: Arc<BlockAssembler>,
+    pplns: Arc<PplnsCalculator>,
+    /// Fallback target for sessions without a vardiff entry yet.
+    default_target: [u8; 32],
+    /// Per-session difficulty tracking, keyed by session_id.
+    session_difficulty: RwLock<HashMap<String, SessionDifficulty>>,
+    vardiff_config: VardiffConfig,
+    /// Most recent job notify, sent to miners on connect so they have work immediately.
+    latest_notify: Arc<RwLock<Option<ServerMessage>>>,
+}
+
+impl ShareValidator {
+    pub fn new(
+        db: PoolDb,
+        stratum: Arc<StratumServer>,
+        jobs: Arc<RwLock<HashMap<String, MiningJob>>>,
+        block_assembler: Arc<BlockAssembler>,
+        pplns: Arc<PplnsCalculator>,
+        pool_target: [u8; 32],
+        vardiff_config: VardiffConfig,
+        latest_notify: Arc<RwLock<Option<ServerMessage>>>,
+    ) -> Self {
+        Self {
+            db,
+            stratum,
+            jobs,
+            block_assembler,
+            pplns,
+            default_target: pool_target,
+            session_difficulty: RwLock::new(HashMap::new()),
+            vardiff_config,
+            latest_notify,
+        }
+    }
+
+    fn make_initial_target(&self) -> ([u8; 32], VardiffTracker) {
+        self.make_target_for_difficulty(self.vardiff_config.initial_difficulty)
+    }
+
+    fn make_target_for_difficulty(&self, difficulty: f64) -> ([u8; 32], VardiffTracker) {
+        let tracker = VardiffTracker::new(
+            self.vardiff_config.target_shares_per_minute,
+            self.vardiff_config.retarget_interval_secs,
+            difficulty,
+        );
+        let target_hex = difficulty_to_target_hex(difficulty);
+        let target = parse_target(&target_hex).unwrap_or(self.default_target);
+        (target, tracker)
+    }
+
+    pub async fn run(&self, mut event_rx: mpsc::Receiver<StratumEvent>) {
+        info!("Share validator started (vardiff: initial_diff={}, target_spm={}, retarget={}s)",
+            self.vardiff_config.initial_difficulty,
+            self.vardiff_config.target_shares_per_minute,
+            self.vardiff_config.retarget_interval_secs,
+        );
+
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                StratumEvent::ShareSubmitted {
+                    session_id,
+                    request_id,
+                    worker_name,
+                    job_id,
+                    time,
+                    nonce_1,
+                    nonce_2,
+                    equihash_solution,
+                } => {
+                    let result = self
+                        .validate_share(
+                            &session_id, &worker_name, &job_id, &time,
+                            &nonce_1, &nonce_2, &equihash_solution,
+                        )
+                        .await;
+
+                    match result {
+                        Ok(share_result) => {
+                            if share_result.is_block {
+                                info!(
+                                    worker = %worker_name,
+                                    job = %job_id,
+                                    height = share_result.block_height.unwrap_or(0),
+                                    "BLOCK FOUND!"
+                                );
+                            } else {
+                                debug!(worker = %worker_name, job = %job_id, "Share accepted");
+                            }
+                            self.stratum
+                                .send_to_session(&session_id, ServerMessage::SubmitResult {
+                                    id: request_id, accepted: true, error: None,
+                                })
+                                .await;
+
+                            // Check vardiff retarget after accepted share
+                            self.maybe_retarget(&session_id).await;
+                        }
+                        Err(e) => {
+                            warn!(worker = %worker_name, error = %e, "Share rejected");
+                            self.stratum
+                                .send_to_session(&session_id, ServerMessage::SubmitResult {
+                                    id: request_id, accepted: false, error: Some(e),
+                                })
+                                .await;
+                        }
+                    }
+                }
+                StratumEvent::WorkerConnected { session_id, worker_name, password, addr } => {
+                    info!(%worker_name, %addr, "Worker connected");
+                    let miner_address = worker_name.split('.').next().unwrap_or(&worker_name);
+                    let wname = worker_name.split('.').nth(1).unwrap_or("default");
+                    if let Err(e) = self.register_worker(miner_address, wname).await {
+                        error!(error = %e, "Failed to register worker");
+                    }
+
+                    // Parse initial difficulty from password (e.g. "d=128")
+                    let requested_diff = parse_difficulty_from_password(&password);
+                    let (target, tracker) = if let Some(diff) = requested_diff {
+                        info!(%session_id, difficulty = diff, "Using miner-requested initial difficulty");
+                        self.make_target_for_difficulty(diff)
+                    } else {
+                        self.make_initial_target()
+                    };
+                    let target_hex = hex::encode(target);
+                    {
+                        let mut sessions = self.session_difficulty.write().await;
+                        sessions.insert(session_id.clone(), SessionDifficulty {
+                            vardiff: tracker,
+                            target,
+                        });
+                    }
+                    info!(%session_id, target = %target_hex, "Sending initial target");
+                    self.stratum
+                        .send_to_session(&session_id, ServerMessage::SetTarget {
+                            target: target_hex,
+                        })
+                        .await;
+
+                    // Send the current job so the miner can start working immediately
+                    let latest = self.latest_notify.read().await;
+                    if let Some(ref notify) = *latest {
+                        self.stratum.send_to_session(&session_id, notify.clone()).await;
+                    }
+                }
+                StratumEvent::SessionDisconnected { session_id } => {
+                    debug!(%session_id, "Session disconnected");
+                    let mut sessions = self.session_difficulty.write().await;
+                    sessions.remove(&session_id);
+                }
+                StratumEvent::TargetSuggested { session_id, target } => {
+                    debug!(%session_id, %target, "Target suggestion received (ignored, using vardiff)");
+                }
+            }
+        }
+    }
+
+    /// Check if a session needs retargeting after an accepted share.
+    async fn maybe_retarget(&self, session_id: &str) {
+        let new_diff = {
+            let mut sessions = self.session_difficulty.write().await;
+            if let Some(sd) = sessions.get_mut(session_id) {
+                sd.vardiff.record_share()
+            } else {
+                None
+            }
+        };
+        if let Some(diff) = new_diff {
+            let target_hex = difficulty_to_target_hex(diff);
+            let new_target = parse_target(&target_hex).unwrap_or(self.default_target);
+            {
+                let mut sessions = self.session_difficulty.write().await;
+                if let Some(sd) = sessions.get_mut(session_id) {
+                    sd.target = new_target;
+                }
+            }
+            info!(%session_id, difficulty = diff, target = %target_hex, "Vardiff retarget");
+            self.stratum
+                .send_to_session(session_id, ServerMessage::SetTarget {
+                    target: target_hex,
+                })
+                .await;
+        }
+    }
+
+    async fn register_worker(&self, address: &str, worker: &str) -> Result<(), pool_db::DbError> {
+        let miner = self.db.get_or_create_miner(address).await?;
+        self.db.get_or_create_worker(miner.id, worker).await?;
+        Ok(())
+    }
+
+    async fn validate_share(
+        &self,
+        _session_id: &str,
+        worker_name: &str,
+        job_id: &str,
+        time: &str,
+        nonce_1: &str,
+        nonce_2: &str,
+        equihash_solution: &str,
+    ) -> Result<ShareResult, StratumError> {
+        let job = {
+            let jobs = self.jobs.read().await;
+            jobs.get(job_id).cloned()
+        };
+        let job = job.ok_or(StratumError::job_not_found())?;
+
+        // Reconstruct the full nonce (32 bytes = nonce_1 + nonce_2)
+        let nonce_hex = format!("{}{}", nonce_1, nonce_2);
+        let nonce = hex::decode(&nonce_hex)
+            .map_err(|_| StratumError::other("Invalid nonce hex"))?;
+        if nonce.len() != 32 {
+            return Err(StratumError::other("Nonce must be 32 bytes"));
+        }
+
+        // Decode the equihash solution bytes from the miner.
+        let solution_bytes = hex::decode(equihash_solution)
+            .map_err(|_| StratumError::other("Invalid solution hex"))?;
+
+        // Equihash(200,9) raw solution is 1344 bytes.
+        // ZIP 301 says miners send WITH compactSize prefix (1347 bytes),
+        // but some miners send WITHOUT (1344 bytes). Handle both.
+        let (raw_solution, solution_for_header) = if solution_bytes.len() == RAW_SOLUTION_SIZE {
+            let mut with_prefix = compact_size(RAW_SOLUTION_SIZE);
+            with_prefix.extend_from_slice(&solution_bytes);
+            (solution_bytes.clone(), with_prefix)
+        } else if solution_bytes.len() > RAW_SOLUTION_SIZE {
+            let raw = strip_compact_size(&solution_bytes)?;
+            if raw.len() != RAW_SOLUTION_SIZE {
+                return Err(StratumError::other(&format!(
+                    "Bad solution size: {} (expected {})", raw.len(), RAW_SOLUTION_SIZE
+                )));
+            }
+            (raw.to_vec(), solution_bytes.clone())
+        } else {
+            return Err(StratumError::other(&format!(
+                "Solution too short: {} bytes", solution_bytes.len()
+            )));
+        };
+
+        // Build the block header input (version + prevhash + merkleroot + reserved + time + bits = 108 bytes)
+        let header_input = build_header_input(&job, time)?;
+
+        debug!(
+            header_len = header_input.len(),
+            raw_soln_len = raw_solution.len(),
+            soln_with_prefix_len = solution_for_header.len(),
+            job_id = %job_id,
+            "Verifying Equihash"
+        );
+
+        // Verify the Equihash solution (n=200, k=9 for Zcash)
+        equihash::is_valid_solution(200, 9, &header_input, &nonce, &raw_solution)
+            .map_err(|e| StratumError::other(&format!("Invalid Equihash solution: {e}")))?;
+
+        // Build the full serialized header for hashing AND block submission.
+        // Block header = header_input(108) + nonce(32) + solution_with_compactSize(1347)
+        let mut full_header = header_input.clone();
+        full_header.extend_from_slice(&nonce);
+        full_header.extend_from_slice(&solution_for_header);
+
+        // Compute SHA-256d of the header (Zcash/Bitcoin block hash)
+        let hash_bytes = sha256d(&full_header);
+
+        // Check against the NETWORK target from the block template
+        let network_target = parse_target(&job.template.target)
+            .map_err(|e| StratumError::other(&format!("Bad network target: {e}")))?;
+        let is_block = meets_target(&hash_bytes, &network_target);
+
+        // Each valid Equihash solution = 1 Sol of work.
+        let difficulty = 1.0;
+
+        // Parse worker name (format: "address.worker")
+        let miner_address = worker_name.split('.').next().unwrap_or(worker_name);
+        let wname = worker_name.split('.').nth(1).unwrap_or("default");
+
+        let miner = self.db.get_or_create_miner(miner_address).await
+            .map_err(|e| StratumError::other(&format!("DB error: {e}")))?;
+        let worker = self.db.get_or_create_worker(miner.id, wname).await
+            .map_err(|e| StratumError::other(&format!("DB error: {e}")))?;
+
+        self.db.record_share(worker.id, job_id, difficulty, is_block).await
+            .map_err(|e| StratumError::other(&format!("DB error: {e}")))?;
+
+        let mut block_height = None;
+
+        if is_block {
+            info!(
+                network_target = %job.template.target,
+                hash = %hex::encode(hash_bytes),
+                height = job.template.height,
+                "Share meets network difficulty!"
+            );
+
+            // Assemble full block: serialized header + transactions
+            match assemble_full_block(&full_header, &job.template) {
+                Ok(full_block) => {
+                    let block_hex = hex::encode(&full_block);
+                    // Write block hex to file for debugging
+                    let _ = std::fs::write("last_block.hex", &block_hex);
+                    match self.block_assembler.submit_block(&block_hex).await {
+                        Ok(_) => {
+                            let height = job.template.height as i64;
+                            let reward = compute_block_reward(height);
+                            let hash_hex = hex::encode(hash_bytes);
+                            match self.db.record_block(height, &hash_hex, reward, worker.id).await {
+                                Ok(block_id) => {
+                                    info!(height, reward, block_id, "Distributing PPLNS rewards");
+                                    if let Err(e) = self.pplns.distribute(reward, block_id).await {
+                                        error!(error = %e, "PPLNS distribution failed");
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(error = %e, "Failed to record block");
+                                }
+                            }
+                            block_height = Some(height);
+                        }
+                        Err(e) => {
+                            error!(error = %e, "Block submission failed");
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "Block assembly failed");
+                }
+            }
+        }
+
+        Ok(ShareResult { is_block, block_height })
+    }
+}
+
+pub struct ShareResult {
+    pub is_block: bool,
+    pub block_height: Option<i64>,
+}
+
+fn sha256d(data: &[u8]) -> [u8; 32] {
+    let first = Sha256::digest(data);
+    let second = Sha256::digest(first);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&second);
+    out
+}
+
+/// Strip the compactSize prefix from a byte slice, returning the payload.
+fn strip_compact_size(data: &[u8]) -> Result<&[u8], StratumError> {
+    if data.is_empty() {
+        return Err(StratumError::other("Empty solution"));
+    }
+    let (prefix_len, size) = match data[0] {
+        0..=252 => (1, data[0] as usize),
+        0xFD => {
+            if data.len() < 3 { return Err(StratumError::other("Truncated compactSize")); }
+            (3, u16::from_le_bytes([data[1], data[2]]) as usize)
+        }
+        0xFE => {
+            if data.len() < 5 { return Err(StratumError::other("Truncated compactSize")); }
+            (5, u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize)
+        }
+        0xFF => {
+            if data.len() < 9 { return Err(StratumError::other("Truncated compactSize")); }
+            (9, u64::from_le_bytes(data[1..9].try_into().unwrap()) as usize)
+        }
+    };
+    if data.len() < prefix_len + size {
+        return Err(StratumError::other("Solution shorter than declared size"));
+    }
+    Ok(&data[prefix_len..prefix_len + size])
+}
+
+fn build_header_input(job: &MiningJob, time_hex: &str) -> Result<Vec<u8>, StratumError> {
+    let mut input = Vec::with_capacity(108);
+
+    let version = hex::decode(&job.version_hex)
+        .map_err(|_| StratumError::other("Invalid version hex"))?;
+    input.extend_from_slice(&version);
+
+    let prev_hash = hex::decode(&job.prev_hash_hex)
+        .map_err(|_| StratumError::other("Invalid prev_hash hex"))?;
+    input.extend_from_slice(&prev_hash);
+
+    let merkle_root = hex::decode(&job.merkle_root_hex)
+        .map_err(|_| StratumError::other("Invalid merkle_root hex"))?;
+    input.extend_from_slice(&merkle_root);
+
+    let reserved = hex::decode(&job.reserved_hex)
+        .map_err(|_| StratumError::other("Invalid reserved hex"))?;
+    input.extend_from_slice(&reserved);
+
+    let time = hex::decode(time_hex)
+        .map_err(|_| StratumError::other("Invalid time hex"))?;
+    input.extend_from_slice(&time);
+
+    let bits = hex::decode(&job.bits_hex)
+        .map_err(|_| StratumError::other("Invalid bits hex"))?;
+    input.extend_from_slice(&bits);
+
+    Ok(input)
+}
+
+/// Check if hash <= target for PoW validity.
+/// SHA-256d output is interpreted as a little-endian 256-bit integer
+/// (byte[31] is MSB, byte[0] is LSB). The target from getblocktemplate
+/// is a big-endian hex string. We compare the reversed hash against
+/// the target, both as big-endian.
+fn meets_target(hash: &[u8; 32], target: &[u8; 32]) -> bool {
+    for i in 0..32 {
+        let h = hash[31 - i];
+        if h < target[i] {
+            return true;
+        } else if h > target[i] {
+            return false;
+        }
+    }
+    true
+}
+
+fn target_to_difficulty(target: &[u8; 32]) -> f64 {
+    let pow_limit: f64 = 2.0f64.powi(251) - 1.0;
+    let mut val: f64 = 0.0;
+    for (i, &byte) in target.iter().enumerate() {
+        val += (byte as f64) * 256.0f64.powi((31 - i) as i32);
+    }
+    if val == 0.0 { return f64::MAX; }
+    pow_limit / val
+}
+
+/// Compute the miner portion of the block reward in zatoshis.
+/// Post-Blossom halving interval is 1,046,400 blocks. Total subsidy starts at 12.5 ZEC
+/// and halves each interval. The miner receives 80% after NU6.
+fn compute_block_reward(height: i64) -> i64 {
+    let halving_interval: i64 = 1_046_400;
+    let initial_subsidy: i64 = 1_250_000_000; // 12.5 ZEC total subsidy
+    if height < 0 { return 0; }
+    let halvings = height / halving_interval;
+    if halvings >= 64 { return 0; }
+    let total_subsidy = initial_subsidy >> halvings;
+    // Miner receives 80% of the subsidy (post-NU6)
+    total_subsidy * 80 / 100
+}
+
+fn compact_size(n: usize) -> Vec<u8> {
+    let n = n as u64;
+    if n < 253 {
+        vec![n as u8]
+    } else if n <= 0xFFFF {
+        let mut v = vec![0xFD];
+        v.extend_from_slice(&(n as u16).to_le_bytes());
+        v
+    } else if n <= 0xFFFFFFFF {
+        let mut v = vec![0xFE];
+        v.extend_from_slice(&(n as u32).to_le_bytes());
+        v
+    } else {
+        let mut v = vec![0xFF];
+        v.extend_from_slice(&n.to_le_bytes());
+        v
+    }
+}
+
+/// Assemble a full block for submitblock: serialized_header + tx_count + transactions.
+fn assemble_full_block(
+    serialized_header: &[u8],
+    template: &node_rpc::types::BlockTemplate,
+) -> Result<Vec<u8>, StratumError> {
+    let coinbase = template.coinbasetxn.as_ref()
+        .ok_or_else(|| StratumError::other("Block template missing coinbase transaction"))?;
+
+    let tx_count = 1 + template.transactions.len();
+    let mut block = serialized_header.to_vec();
+    block.extend_from_slice(&compact_size(tx_count));
+
+    let coinbase_bytes = hex::decode(&coinbase.data)
+        .map_err(|_| StratumError::other("Invalid coinbase hex"))?;
+    block.extend_from_slice(&coinbase_bytes);
+
+    for tx in &template.transactions {
+        let tx_bytes = hex::decode(&tx.data)
+            .map_err(|_| StratumError::other("Invalid transaction hex"))?;
+        block.extend_from_slice(&tx_bytes);
+    }
+
+    Ok(block)
+}
+
+/// Parse difficulty from the miner's password field.
+/// Supports formats: "d=128", "sd=128", "d=128,other_option"
+fn parse_difficulty_from_password(password: &str) -> Option<f64> {
+    for part in password.split(',') {
+        let part = part.trim();
+        if let Some(val) = part.strip_prefix("d=").or_else(|| part.strip_prefix("sd=")) {
+            if let Ok(d) = val.parse::<f64>() {
+                if d > 0.0 {
+                    return Some(d);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn parse_target(target_hex: &str) -> Result<[u8; 32], String> {
+    let bytes = hex::decode(target_hex).map_err(|e| format!("Invalid target hex: {e}"))?;
+    if bytes.len() > 32 {
+        return Err(format!("Target too long: {} bytes", bytes.len()));
+    }
+    let mut padded = [0u8; 32];
+    let offset = 32 - bytes.len();
+    padded[offset..].copy_from_slice(&bytes);
+    Ok(padded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sha256d() {
+        let hash = sha256d(b"hello");
+        assert_eq!(hash.len(), 32);
+        let expected = "9595c9df90075148eb06860365df33584b75bff782a510c6cd4883a419833d50";
+        assert_eq!(hex::encode(hash), expected);
+    }
+
+    #[test]
+    fn test_meets_target_easy() {
+        let hash = [0u8; 32];
+        let target = [0xff; 32];
+        assert!(meets_target(&hash, &target));
+    }
+
+    #[test]
+    fn test_strip_compact_size_1344() {
+        let mut data = vec![0xFD, 0x40, 0x05]; // compactSize(1344)
+        data.extend_from_slice(&[0xCC; 1344]);
+        let raw = strip_compact_size(&data).unwrap();
+        assert_eq!(raw.len(), 1344);
+    }
+
+    #[test]
+    fn test_block_reward() {
+        // At height 1: total 12.5 ZEC, miner gets 80% = 10 ZEC
+        assert_eq!(compute_block_reward(1), 1_000_000_000);
+        // After 1st halving: total 6.25 ZEC, miner gets 5 ZEC
+        assert_eq!(compute_block_reward(1_046_400), 500_000_000);
+        // After 3rd halving (testnet current): total 1.5625, miner gets 1.25 ZEC
+        assert_eq!(compute_block_reward(3_853_089), 125_000_000);
+    }
+
+    #[test]
+    fn test_parse_target() {
+        let t = parse_target("0007ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff").unwrap();
+        assert_eq!(t[0], 0x00);
+        assert_eq!(t[1], 0x07);
+        assert_eq!(t[31], 0xff);
+    }
+}

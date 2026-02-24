@@ -1,0 +1,13 @@
+/target
+*.db
+*.db-shm
+*.db-wal
+*.hex
+.cursor/
+.env*
+*.pem
+*.key
+
+# Real config files (use .example versions as templates)
+config/pool.toml
+config/zebrad.toml

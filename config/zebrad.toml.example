@@ -1,0 +1,21 @@
+# Zebra testnet configuration for mining pool integration.
+# See: https://zebra.zfnd.org/user/mining-testnet-s-nomp.html
+
+[network]
+network = "Testnet"
+listen_addr = "0.0.0.0:18233"
+
+[state]
+cache_dir = "/path/to/zebrad/state"
+
+[rpc]
+# Bind to 127.0.0.1 for local-only access, or 0.0.0.0 if pool runs on a different host
+listen_addr = "127.0.0.1:18232"
+enable_cookie_auth = false
+
+[mining]
+# Replace with your own testnet transparent address
+miner_address = "YOUR_TESTNET_ADDRESS_HERE"
+
+[tracing]
+endpoint_addr = "127.0.0.1:3000"

@@ -1,0 +1,43 @@
+[pool]
+name = "ZcashTestPool"
+fee_percent = 1.0
+
+[stratum]
+listen_addr = "0.0.0.0:3333"
+# Bytes used for nonce1 (remaining 32 - nonce1_size bytes are nonce2 for miner)
+nonce1_size = 4
+
+[node]
+rpc_url = "http://127.0.0.1:18232"
+# rpc_user = "your_rpc_user"
+# rpc_password = "your_rpc_password"
+
+[difficulty]
+initial_target = "0800000000000000000000000000000000000000000000000000000000000000"
+# Target shares per minute from each miner (~60 Sol/s produces ~80-120 shares/min at diff 1)
+target_shares_per_minute = 100.0
+retarget_interval_secs = 30
+
+[pplns]
+# Window size as a multiple of expected shares per block
+window_multiplier = 2.0
+
+# Payout pipeline: check_block_maturity -> shield_coinbase -> process_payouts
+# Phase 2 calls z_shieldcoinbase (batches of 50 UTXOs, up to 10 batches/cycle)
+# Phase 3 calls z_sendmany from shielded pool_address to miners
+[payout]
+enabled = true
+pool_address = "YOUR_UNIFIED_ADDRESS_HERE"
+mining_address = "YOUR_TRANSPARENT_ADDRESS_HERE"
+maturity_confirmations = 100
+wallet_rpc_url = "http://127.0.0.1:28232"
+wallet_rpc_user = "your_wallet_user"
+wallet_rpc_password = "your_wallet_password"
+minimum_payout = 0.01
+interval_secs = 300
+
+[api]
+listen_addr = "0.0.0.0:8080"
+
+[database]
+url = "sqlite://pool.db?mode=rwc"
