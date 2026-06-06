@@ -328,6 +328,7 @@ async fn main() -> Result<()> {
         }
         _ => Arc::new(ZcashRpcClient::new(&config.node.rpc_url)),
     };
+    validate_direct_shielded_template(&rpc, config.payout.coinbase_payout_mode).await?;
 
     // Shared latest notify message — used by both stratum (send on subscribe)
     // and job manager (updates on each new template).
@@ -525,5 +526,35 @@ async fn main() -> Result<()> {
     status_handle.abort();
 
     info!("Pool shut down gracefully");
+    Ok(())
+}
+
+async fn validate_direct_shielded_template(
+    rpc: &ZcashRpcClient,
+    coinbase_payout_mode: CoinbasePayoutMode,
+) -> Result<()> {
+    if coinbase_payout_mode != CoinbasePayoutMode::DirectShielded {
+        return Ok(());
+    }
+
+    let template = rpc
+        .get_block_template()
+        .await
+        .context("failed to fetch node block template for direct shielded coinbase validation")?;
+    let coinbase = template
+        .coinbasetxn
+        .as_ref()
+        .context("node block template did not include coinbasetxn")?;
+    let transparent_outputs = coinbase
+        .transparent_output_count()
+        .map_err(|e| anyhow::anyhow!("failed to inspect template coinbase transaction: {e}"))?;
+
+    if transparent_outputs > 0 {
+        anyhow::bail!(
+            "payout.coinbase_mode = \"direct_shielded\" requires the node getblocktemplate coinbase to have no transparent outputs; check Zebra [mining].miner_address before starting the pool"
+        );
+    }
+
+    info!("Verified direct shielded coinbase template has no transparent outputs");
     Ok(())
 }

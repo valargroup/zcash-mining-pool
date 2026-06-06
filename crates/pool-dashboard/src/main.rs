@@ -653,7 +653,15 @@ async fn run_payout_loop(
         }
 
         // Phase 3: Pay miners from shielded pool (only if balance is sufficient)
-        match process_payouts(&db, &wallet_rpc, pool_address, mining_address, min_payout_zatoshis, network).await {
+        match process_payouts(
+            &db,
+            &wallet_rpc,
+            pool_address,
+            mining_address,
+            coinbase_payout_mode,
+            min_payout_zatoshis,
+            network,
+        ).await {
             Ok(count) => {
                 if count > 0 {
                     info!(payouts = count, "Payout round completed");
@@ -925,6 +933,7 @@ async fn process_payouts(
     rpc: &ZcashRpcClient,
     pool_address: &str,
     mining_address: &str,
+    coinbase_payout_mode: CoinbasePayoutMode,
     min_payout_zatoshis: i64,
     network: &str,
 ) -> anyhow::Result<usize> {
@@ -969,6 +978,14 @@ async fn process_payouts(
         let pay_to = if is_valid_zcash_address(&p.address, network) {
             p.address.clone()
         } else if p.created_at <= two_days_ago {
+            if coinbase_payout_mode == CoinbasePayoutMode::DirectShielded {
+                warn!(
+                    miner_id = p.miner_id, address = %p.address, created_at = %p.created_at,
+                    amount_zec = p.amount as f64 / ZATOSHIS_PER_ZEC,
+                    "Holding payout: invalid address format (direct shielded mode has no non-source fallback)"
+                );
+                continue;
+            }
             warn!(
                 miner_id = p.miner_id, address = %p.address, created_at = %p.created_at,
                 amount_zec = p.amount as f64 / ZATOSHIS_PER_ZEC,

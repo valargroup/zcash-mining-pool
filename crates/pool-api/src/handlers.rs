@@ -1,7 +1,7 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{Html, Json};
-use node_rpc::ZcashRpcClient;
+use node_rpc::{ZcashRpcClient, GET_BLOCK_TEMPLATE_TIMEOUT_SECS};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
@@ -13,10 +13,10 @@ pub type AppState = Arc<ApiState>;
 
 /// If no template received in this many ms, the pool is considered stalled.
 ///
-/// This must exceed the node RPC `getblocktemplate` timeout. Direct Orchard
-/// coinbase templates can legitimately spend up to 120s in Zebra proof
-/// generation before `last_template_at_ms` is refreshed.
-const STALL_THRESHOLD_MS: i64 = 180_000;
+/// This must exceed the effective long-poll `getblocktemplate` timeout. The
+/// default long-poll hold time is 120s, and node-rpc adds the regular 120s
+/// template-build allowance after the long-poll wakes.
+const STALL_THRESHOLD_MS: i64 = ((GET_BLOCK_TEMPLATE_TIMEOUT_SECS as i64) * 2 + 60) * 1000;
 
 /// Zcash target block interval.
 const BLOCK_TIME_SECS: f64 = 75.0;
