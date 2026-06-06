@@ -56,7 +56,7 @@ window_multiplier = 2.0
 enabled = true
 # "transparent" mines to mining_address, then calls z_shieldcoinbase into pool_address.
 # "direct_shielded" expects Zebra mining.miner_address = pool_address and skips z_shieldcoinbase.
-# Verify the address receiver type with your Zebra build before using direct_shielded.
+# For Orchard, use an Orchard-only unified address and verify it with your Zebra build.
 coinbase_mode = "transparent"
 pool_address = "YOUR_UNIFIED_ADDRESS_HERE"
 mining_address = "YOUR_TRANSPARENT_ADDRESS_HERE"

@@ -193,14 +193,14 @@ Also update `config/zebrad.toml`: `network = "Mainnet"`, ports `8232`/`8233`.
 `mining_address`, the dashboard runs `z_shieldcoinbase` into `pool_address`, and
 then payouts use `z_sendmany`.
 
-To mine directly to the pool's shielded wallet, set
+To mine directly to the pool's Orchard wallet, set
 `coinbase_mode = "direct_shielded"`, omit `mining_address` or set it equal to
 `pool_address`, and configure Zebra's `[mining] miner_address` to the same pool
 UA. In this mode the dashboard skips `z_shieldcoinbase`. Verify the address
 receiver type with your Zebra build before switching production mining; the
-regtest proof for this mode used a Sapling receiver. If you need a coinbase tag,
-set Zebra's `mining.extra_coinbase_data`; the pool's `coinbase_tag` injector is
-only for transparent coinbase mode.
+regtest proof for this mode used an Orchard-only unified address. If you need a
+coinbase tag, set Zebra's `mining.extra_coinbase_data`; the pool's
+`coinbase_tag` injector is only for transparent coinbase mode.
 
 Then rebuild and restart:
 
