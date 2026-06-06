@@ -84,6 +84,123 @@ pub struct CoinbaseTxn {
     pub required: Option<bool>,
 }
 
+impl CoinbaseTxn {
+    /// Count transparent outputs in the serialized coinbase transaction.
+    pub fn transparent_output_count(&self) -> Result<usize, String> {
+        transparent_output_count_from_tx_hex(&self.data)
+    }
+}
+
+fn transparent_output_count_from_tx_hex(tx_hex: &str) -> Result<usize, String> {
+    let data = hex::decode(tx_hex).map_err(|e| format!("invalid coinbase hex: {e}"))?;
+    if data.len() < 4 {
+        return Err("coinbase transaction is too short".to_string());
+    }
+
+    let header_len = match data[0..4] {
+        [0x05, 0x00, 0x00, 0x80] => 20,
+        [0x04, 0x00, 0x00, 0x80] => 8,
+        _ => {
+            return Err(format!(
+                "unsupported coinbase transaction version {:02x}{:02x}{:02x}{:02x}",
+                data[0], data[1], data[2], data[3]
+            ));
+        }
+    };
+
+    if data.len() < header_len {
+        return Err("coinbase transaction is shorter than its header".to_string());
+    }
+
+    let (input_count, input_count_len) = read_compact_size(&data, header_len)?;
+    let output_count_offset =
+        skip_transparent_inputs(&data, header_len + input_count_len, input_count)?;
+    let (output_count, _) = read_compact_size(&data, output_count_offset)?;
+    Ok(output_count)
+}
+
+fn skip_transparent_inputs(
+    data: &[u8],
+    mut offset: usize,
+    input_count: usize,
+) -> Result<usize, String> {
+    for _ in 0..input_count {
+        let script_len_offset = offset
+            .checked_add(36)
+            .ok_or_else(|| "transparent input offset overflow".to_string())?;
+        if data.len() < script_len_offset {
+            return Err("coinbase transaction is truncated before input script".to_string());
+        }
+
+        let (script_len, script_len_size) = read_compact_size(data, script_len_offset)?;
+        let script_start = script_len_offset
+            .checked_add(script_len_size)
+            .ok_or_else(|| "input script offset overflow".to_string())?;
+        let script_end = script_start
+            .checked_add(script_len)
+            .ok_or_else(|| "input script length overflow".to_string())?;
+        offset = script_end
+            .checked_add(4)
+            .ok_or_else(|| "transparent input sequence offset overflow".to_string())?;
+        if data.len() < offset {
+            return Err("coinbase transaction is truncated inside input".to_string());
+        }
+    }
+
+    Ok(offset)
+}
+
+fn read_compact_size(data: &[u8], offset: usize) -> Result<(usize, usize), String> {
+    if offset >= data.len() {
+        return Err("compactSize offset is past the end of the transaction".to_string());
+    }
+
+    match data[offset] {
+        0..=252 => Ok((data[offset] as usize, 1)),
+        0xFD => {
+            if offset + 3 > data.len() {
+                return Err("truncated compactSize u16".to_string());
+            }
+            Ok((
+                u16::from_le_bytes([data[offset + 1], data[offset + 2]]) as usize,
+                3,
+            ))
+        }
+        0xFE => {
+            if offset + 5 > data.len() {
+                return Err("truncated compactSize u32".to_string());
+            }
+            Ok((
+                u32::from_le_bytes([
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                    data[offset + 4],
+                ]) as usize,
+                5,
+            ))
+        }
+        0xFF => {
+            if offset + 9 > data.len() {
+                return Err("truncated compactSize u64".to_string());
+            }
+            let value = u64::from_le_bytes([
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+                data[offset + 4],
+                data[offset + 5],
+                data[offset + 6],
+                data[offset + 7],
+                data[offset + 8],
+            ]);
+            usize::try_from(value)
+                .map(|v| (v, 9))
+                .map_err(|_| "compactSize value does not fit usize".to_string())
+        }
+    }
+}
+
 /// Response from `getblockcount`.
 pub type BlockCount = u64;
 
@@ -120,6 +237,52 @@ pub struct JsonRpcResponse<T> {
     pub id: Option<u64>,
     pub result: Option<T>,
     pub error: Option<JsonRpcError>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CoinbaseTxn;
+
+    fn v5_coinbase_with_output_count(output_count: u8) -> CoinbaseTxn {
+        let mut bytes = vec![
+            0x05, 0x00, 0x00, 0x80, // v5 overwintered
+            0x0a, 0x27, 0xa7, 0x26, // version group id
+            0xc8, 0xe7, 0x10, 0x55, // consensus branch id
+            0x00, 0x00, 0x00, 0x00, // lock time
+            0x00, 0x00, 0x00, 0x00, // expiry height
+            0x01, // one transparent input
+        ];
+        bytes.extend_from_slice(&[0; 32]);
+        bytes.extend_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+        bytes.push(1);
+        bytes.push(0);
+        bytes.extend_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+        bytes.push(output_count);
+
+        CoinbaseTxn {
+            data: hex::encode(bytes),
+            hash: String::new(),
+            fee: None,
+            sigops: None,
+            required: None,
+        }
+    }
+
+    #[test]
+    fn counts_zero_transparent_outputs() {
+        assert_eq!(
+            v5_coinbase_with_output_count(0).transparent_output_count(),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn counts_existing_transparent_outputs() {
+        assert_eq!(
+            v5_coinbase_with_output_count(2).transparent_output_count(),
+            Ok(2)
+        );
+    }
 }
 
 /// JSON-RPC error object.

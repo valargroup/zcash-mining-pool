@@ -278,8 +278,12 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
     let scan_count = estimated_blocks.min(max_blocks);
     let start_height = (tip).saturating_sub(scan_count).max(1);
 
-    let our_mining_address = state.mining_address.clone().unwrap_or_default();
     let direct_shielded_mode = state.coinbase_payout_mode == CoinbasePayoutMode::DirectShielded;
+    let our_mining_address = if direct_shielded_mode {
+        String::new()
+    } else {
+        state.mining_address.clone().unwrap_or_default()
+    };
 
     let mut direct_pool_block_hashes = HashSet::new();
     let mut direct_pool_block_heights = HashSet::new();
@@ -353,7 +357,7 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let (mut miner_address, reward_zec, coinbase_text, coinbase_hex, coinbase_tx_version) =
+        let (miner_address, reward_zec, coinbase_text, coinbase_hex, coinbase_tx_version) =
             extract_coinbase_from_block(block_data);
 
         let direct_pool_hash_match =
@@ -361,13 +365,6 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
         let direct_pool_height_fallback =
             direct_shielded_mode && hash.is_empty() && direct_pool_block_heights.contains(height);
         let is_recorded_direct_pool_block = direct_pool_hash_match || direct_pool_height_fallback;
-        if is_recorded_direct_pool_block
-            && miner_address == "unknown"
-            && !our_mining_address.is_empty()
-        {
-            miner_address = our_mining_address.clone();
-        }
-
         let is_our_pool = (!our_mining_address.is_empty() && miner_address == our_mining_address)
             || is_recorded_direct_pool_block;
         let pool_name = if is_our_pool {
@@ -396,10 +393,10 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
 
     // Build distribution.
     // Track (block_count, zebrad_count, tx_version_counts) per address.
-    let mut addr_stats: HashMap<String, (u64, u64, HashMap<i32, u64>)> = HashMap::new();
+    let mut addr_stats: HashMap<(String, bool), (u64, u64, HashMap<i32, u64>)> = HashMap::new();
     for b in &blocks {
         let entry = addr_stats
-            .entry(b.miner_address.clone())
+            .entry((b.miner_address.clone(), b.is_our_pool))
             .or_insert((0, 0, HashMap::new()));
         entry.0 += 1;
         if b.is_zebrad {
@@ -411,8 +408,7 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
     let total = blocks.len() as f64;
     let mut distribution: Vec<MinerDistribution> = addr_stats
         .into_iter()
-        .map(|(addr, (count, zcount, ver_counts))| {
-            let is_our_pool = !our_mining_address.is_empty() && addr == our_mining_address;
+        .map(|((addr, is_our_pool), (count, zcount, ver_counts))| {
             let pool_name = if is_our_pool {
                 Some("Our Pool".to_string())
             } else {

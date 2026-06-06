@@ -107,10 +107,9 @@ impl ZcashRpcClient {
     /// Long-polling variant of `get_block_template`. The node blocks until
     /// the template identified by `longpollid` is no longer current (new
     /// block, mempool change, etc.) and then returns the new template.
-    /// Uses `timeout` as a hard cap on the HTTP request so the pool can
-    /// fall back to regular polling if the node hangs. The cap is floored
-    /// at the regular block template timeout because direct Orchard coinbase
-    /// templates can take longer than older 60s longpoll defaults.
+    /// Uses `timeout` as the expected long-poll hold time, plus the regular
+    /// block template timeout for the template Zebra builds after the
+    /// long-poll wakes.
     pub async fn get_block_template_longpoll(
         &self,
         longpollid: &str,
@@ -121,11 +120,7 @@ impl ZcashRpcClient {
             "mode": "template",
             "longpollid": longpollid,
         }]);
-        let timeout = if timeout < GET_BLOCK_TEMPLATE_TIMEOUT {
-            GET_BLOCK_TEMPLATE_TIMEOUT
-        } else {
-            timeout
-        };
+        let timeout = timeout.saturating_add(GET_BLOCK_TEMPLATE_TIMEOUT);
         self.call_with_timeout("getblocktemplate", params, timeout).await
     }
 

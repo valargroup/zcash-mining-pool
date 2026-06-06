@@ -322,6 +322,7 @@ async fn main() -> Result<()> {
         }
         _ => Arc::new(ZcashRpcClient::new(&config.node.rpc_url)),
     };
+    validate_direct_shielded_template(&rpc, &config.payout).await?;
 
     // Wallet RPC for Zallet monitoring (balance/health checks + trigger_payout)
     let wallet_rpc = config.payout.wallet_rpc_url.as_ref().map(|url| {
@@ -578,6 +579,36 @@ fn pool_core_parse_target(hex_str: &str) -> Result<[u8; 32]> {
     let offset = 32 - bytes.len();
     target[offset..].copy_from_slice(&bytes);
     Ok(target)
+}
+
+async fn validate_direct_shielded_template(
+    rpc: &ZcashRpcClient,
+    payout: &PayoutConfig,
+) -> Result<()> {
+    if !payout.enabled || payout.coinbase_payout_mode != CoinbasePayoutMode::DirectShielded {
+        return Ok(());
+    }
+
+    let template = rpc
+        .get_block_template()
+        .await
+        .context("failed to fetch node block template for direct shielded coinbase validation")?;
+    let coinbase = template
+        .coinbasetxn
+        .as_ref()
+        .context("node block template did not include coinbasetxn")?;
+    let transparent_outputs = coinbase
+        .transparent_output_count()
+        .map_err(|e| anyhow::anyhow!("failed to inspect template coinbase transaction: {e}"))?;
+
+    if transparent_outputs > 0 {
+        anyhow::bail!(
+            "payout.coinbase_mode = \"direct_shielded\" requires the node getblocktemplate coinbase to have no transparent outputs; check Zebra [mining].miner_address before skipping z_shieldcoinbase"
+        );
+    }
+
+    info!("Verified direct shielded coinbase template has no transparent outputs");
+    Ok(())
 }
 
 // -- Payout loop --

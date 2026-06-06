@@ -7,7 +7,7 @@
 #   [node]       — both restart
 #   [difficulty]  — pool restart
 #   [pplns]      — pool restart
-#   [payout]     — dashboard restart only (zero miner impact)
+#   [payout]     — dashboard restart. coinbase_mode also requires a pool restart.
 #   [api]        — dashboard restart only
 #   [admin]      — dashboard restart only
 #   [database]   — both restart
@@ -50,12 +50,14 @@ retarget_interval_secs = 30
 # Window size as a multiple of expected shares per block
 window_multiplier = 2.0
 
-# All payout settings require a dashboard restart only (zero miner impact).
+# Most payout settings require a dashboard restart only. coinbase_mode is also
+# read by zcash-pool, so changing it requires restarting both services.
 # Payout pipeline: check_block_maturity -> optional shield_coinbase -> process_payouts
 [payout]
 enabled = true
 # "transparent" mines to mining_address, then calls z_shieldcoinbase into pool_address.
 # "direct_shielded" expects Zebra mining.miner_address = pool_address and skips z_shieldcoinbase.
+# Restart zcash-pool after changing this mode so coinbase_tag handling matches the mode.
 # For Orchard, use an Orchard-only unified address and verify it with your Zebra build.
 coinbase_mode = "transparent"
 pool_address = "YOUR_UNIFIED_ADDRESS_HERE"
