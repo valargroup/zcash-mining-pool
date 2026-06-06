@@ -18,7 +18,7 @@ fee_percent = 1.0                       # pool restart (used by PPLNS at block c
 # "testnet" or "mainnet" — controls address validation, currency symbol (TAZ/ZEC), and badge
 network = "testnet"                     # both restart
 # hostname = "pool.example.com"         # dashboard restart — shown in stratum URL on dashboard
-# coinbase_tag = "MyPool"               # pool restart — injected into coinbase scriptSig
+# coinbase_tag = "MyPool"               # pool restart — transparent coinbase mode only. In direct_shielded mode, set Zebra mining.extra_coinbase_data instead.
 # banner = "Welcome to the pool!"       # dashboard restart — shown at top of public dashboard
 
 # All stratum settings require a pool restart (miners reconnect).
@@ -51,11 +51,13 @@ retarget_interval_secs = 30
 window_multiplier = 2.0
 
 # All payout settings require a dashboard restart only (zero miner impact).
-# Payout pipeline: check_block_maturity -> shield_coinbase -> process_payouts
-# Phase 2 calls z_shieldcoinbase (batches of 50 UTXOs, up to 10 batches/cycle)
-# Phase 3 calls z_sendmany from shielded pool_address to miners
+# Payout pipeline: check_block_maturity -> optional shield_coinbase -> process_payouts
 [payout]
 enabled = true
+# "transparent" mines to mining_address, then calls z_shieldcoinbase into pool_address.
+# "direct_shielded" expects Zebra mining.miner_address = pool_address and skips z_shieldcoinbase.
+# Verify the address receiver type with your Zebra build before using direct_shielded.
+coinbase_mode = "transparent"
 pool_address = "YOUR_UNIFIED_ADDRESS_HERE"
 mining_address = "YOUR_TRANSPARENT_ADDRESS_HERE"
 maturity_confirmations = 100

@@ -10,7 +10,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use node_rpc::ZcashRpcClient;
-use pool_api::{ApiState, AppState};
+use pool_api::{ApiState, AppState, CoinbasePayoutMode};
 use pool_db::PoolDb;
 
 const ZATOSHIS_PER_ZEC: f64 = 100_000_000.0;
@@ -179,6 +179,8 @@ struct PayoutConfig {
     pool_address: Option<String>,
     #[serde(default)]
     mining_address: Option<String>,
+    #[serde(default, rename = "coinbase_mode")]
+    coinbase_payout_mode: CoinbasePayoutMode,
     #[serde(default)]
     wallet_rpc_url: Option<String>,
     #[serde(default)]
@@ -209,6 +211,7 @@ impl Default for PayoutConfig {
             enabled: false,
             pool_address: None,
             mining_address: None,
+            coinbase_payout_mode: CoinbasePayoutMode::default(),
             wallet_rpc_url: None,
             wallet_rpc_user: None,
             wallet_rpc_password: None,
@@ -216,6 +219,34 @@ impl Default for PayoutConfig {
             interval_secs: default_payout_interval(),
             maturity_confirmations: default_maturity(),
         }
+    }
+}
+
+impl PayoutConfig {
+    fn effective_mining_address(&self) -> Option<String> {
+        self.mining_address
+            .clone()
+            .or_else(|| self.pool_address.clone())
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.enabled && self.coinbase_payout_mode == CoinbasePayoutMode::DirectShielded {
+            let pool_address = self
+                .pool_address
+                .as_ref()
+                .context("payout.pool_address is required when direct shielded coinbase is enabled")?;
+            let mining_address = self
+                .effective_mining_address()
+                .context("payout.mining_address or payout.pool_address is required when direct shielded coinbase is enabled")?;
+
+            if mining_address != *pool_address {
+                anyhow::bail!(
+                    "payout.coinbase_mode = \"direct_shielded\" requires payout.mining_address to be omitted or equal to payout.pool_address"
+                );
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -255,6 +286,7 @@ async fn main() -> Result<()> {
         .with_context(|| format!("Failed to read config file: {config_path}"))?;
     let mut config: Config =
         toml::from_str(&config_str).with_context(|| "Failed to parse config file")?;
+    config.payout.validate()?;
 
     if let Some(port) = port_override {
         config.api.listen_addr = format!("0.0.0.0:{port}");
@@ -339,7 +371,8 @@ async fn main() -> Result<()> {
         last_template_at_ms: None, // DB fallback
         wallet_rpc,
         pool_address: config.payout.pool_address.clone(),
-        mining_address: config.payout.mining_address.clone(),
+        mining_address: config.payout.effective_mining_address(),
+        coinbase_payout_mode: config.payout.coinbase_payout_mode,
         min_payout_zatoshis: (config.payout.minimum_payout * ZATOSHIS_PER_ZEC) as i64,
         maturity_confirmations: config.payout.maturity_confirmations,
         network_blocks_cache: tokio::sync::RwLock::new(std::collections::HashMap::new()),
@@ -398,7 +431,8 @@ async fn main() -> Result<()> {
                 min_payout_zec: config.payout.minimum_payout,
                 maturity_confirmations: config.payout.maturity_confirmations,
                 pool_address: config.payout.pool_address.clone(),
-                mining_address: config.payout.mining_address.clone(),
+                mining_address: config.payout.effective_mining_address(),
+                coinbase_payout_mode: config.payout.coinbase_payout_mode,
                 node_rpc_url: config.node.rpc_url.clone(),
                 wallet_rpc_url: config.payout.wallet_rpc_url.clone(),
                 coinbase_tag: config.pool.coinbase_tag.clone(),
@@ -458,7 +492,7 @@ async fn main() -> Result<()> {
     let payout_handle = if config.payout.enabled {
         let pool_address = config.payout.pool_address.clone()
             .expect("payout.pool_address is required when payouts are enabled");
-        let mining_address = config.payout.mining_address.clone()
+        let mining_address = config.payout.effective_mining_address()
             .unwrap_or_else(|| pool_address.clone());
         let wallet_url = config.payout.wallet_rpc_url.clone()
             .expect("payout.wallet_rpc_url is required when payouts are enabled");
@@ -469,12 +503,14 @@ async fn main() -> Result<()> {
         let min_payout_zatoshis = (config.payout.minimum_payout * ZATOSHIS_PER_ZEC) as i64;
         let interval = Duration::from_secs(config.payout.interval_secs);
         let maturity = config.payout.maturity_confirmations;
+        let coinbase_payout_mode = config.payout.coinbase_payout_mode;
         let payout_db = db.clone();
         let node_rpc = Arc::clone(&rpc);
         let payout_network = config.pool.network.clone();
         info!(
             pool_address = %pool_address,
             mining_address = %mining_address,
+            coinbase_mode = %coinbase_payout_mode.as_str(),
             wallet_rpc = %wallet_url,
             min_payout_zec = config.payout.minimum_payout,
             interval_secs = config.payout.interval_secs,
@@ -485,7 +521,7 @@ async fn main() -> Result<()> {
             run_payout_loop(
                 payout_db, node_rpc, payout_wallet_rpc,
                 &pool_address, &mining_address,
-                min_payout_zatoshis, maturity, interval,
+                coinbase_payout_mode, min_payout_zatoshis, maturity, interval,
                 &payout_network,
             ).await;
         }))
@@ -559,6 +595,7 @@ async fn run_payout_loop(
     wallet_rpc: Arc<ZcashRpcClient>,
     pool_address: &str,
     mining_address: &str,
+    coinbase_payout_mode: CoinbasePayoutMode,
     min_payout_zatoshis: i64,
     maturity_confirmations: u64,
     interval: Duration,
@@ -577,10 +614,11 @@ async fn run_payout_loop(
             error!(error = %e, "Block maturity check failed");
         }
 
-        // Phase 2: Shield mature coinbase UTXOs (transparent -> shielded).
-        // Shields in batches of 50 UTXOs, up to MAX_SHIELD_BATCHES_PER_CYCLE per cycle.
-        if let Err(e) = shield_coinbase(&wallet_rpc, mining_address, pool_address).await {
-            error!(error = %e, "Coinbase shielding failed (will retry next cycle)");
+        // Phase 2: Shield mature coinbase UTXOs when mining to a transparent address.
+        if coinbase_payout_mode.uses_coinbase_shielding() {
+            if let Err(e) = shield_coinbase(&wallet_rpc, mining_address, pool_address).await {
+                error!(error = %e, "Coinbase shielding failed (will retry next cycle)");
+            }
         }
 
         // Phase 3: Pay miners from shielded pool (only if balance is sufficient)
@@ -601,7 +639,7 @@ async fn run_payout_loop(
 
         // Write payout health status for the admin health page to read.
         let _ = write_payout_health(
-            &db, &wallet_rpc, mining_address,
+            &db, &wallet_rpc, coinbase_payout_mode,
             consecutive_payout_failures, &last_payout_error,
         ).await;
 
@@ -613,7 +651,7 @@ async fn run_payout_loop(
 async fn write_payout_health(
     db: &PoolDb,
     wallet_rpc: &ZcashRpcClient,
-    mining_address: &str,
+    coinbase_payout_mode: CoinbasePayoutMode,
     consecutive_failures: u32,
     last_error: &str,
 ) -> anyhow::Result<()> {
@@ -633,7 +671,7 @@ async fn write_payout_health(
 
     // Check if there are confirmed (mature) blocks whose coinbase hasn't been shielded.
     // If transparent balance > 0 and we have mature blocks, shielding might be stuck.
-    let shielding_stuck = transparent_zec > 0.01;
+    let shielding_stuck = coinbase_payout_mode.uses_coinbase_shielding() && transparent_zec > 0.01;
 
     // Check for Zallet sync issues by attempting a simple RPC
     let wallet_responsive = wallet_rpc.call_raw::<serde_json::Value>(
@@ -645,6 +683,7 @@ async fn write_payout_health(
         "last_payout_error": last_error,
         "transparent_balance_zec": transparent_zec,
         "private_balance_zec": private_zec,
+        "coinbase_mode": coinbase_payout_mode.as_str(),
         "shielding_stuck": shielding_stuck,
         "wallet_responsive": wallet_responsive,
         "checked_at": chrono::Utc::now().to_rfc3339(),

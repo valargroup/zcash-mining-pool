@@ -2,7 +2,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{Html, Json};
 use node_rpc::ZcashRpcClient;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -16,6 +16,35 @@ const STALL_THRESHOLD_MS: i64 = 90_000;
 
 /// Zcash target block interval.
 const BLOCK_TIME_SECS: f64 = 75.0;
+
+/// How mined coinbase rewards reach the shielded payout account.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoinbasePayoutMode {
+    /// Mine to a transparent address, then run `z_shieldcoinbase`.
+    Transparent,
+    /// Configure Zebra to mine directly to the pool's shielded payout address.
+    DirectShielded,
+}
+
+impl CoinbasePayoutMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Transparent => "transparent",
+            Self::DirectShielded => "direct_shielded",
+        }
+    }
+
+    pub fn uses_coinbase_shielding(self) -> bool {
+        matches!(self, Self::Transparent)
+    }
+}
+
+impl Default for CoinbasePayoutMode {
+    fn default() -> Self {
+        Self::Transparent
+    }
+}
 
 pub struct ApiState {
     pub db: PoolDb,
@@ -33,8 +62,10 @@ pub struct ApiState {
     pub wallet_rpc: Option<Arc<ZcashRpcClient>>,
     /// Pool payout address (unified address for z_sendmany).
     pub pool_address: Option<String>,
-    /// Mining address (transparent, for shielding).
+    /// Effective coinbase destination address for the selected payout mode.
     pub mining_address: Option<String>,
+    /// Selected coinbase payout mode.
+    pub coinbase_payout_mode: CoinbasePayoutMode,
     /// Minimum payout in zatoshis.
     pub min_payout_zatoshis: i64,
     /// Maturity confirmations required.
@@ -607,63 +638,67 @@ pub async fn trigger_payout(
         }
     }
 
-    // Phase 2: Shield coinbase (if mining_address differs from pool_address)
+    // Phase 2: Shield coinbase if the pool mines transparent coinbase rewards.
     let mut shielded = false;
-    if let Some(ref mining_addr) = state.mining_address {
-        if *mining_addr != pool_address {
-            match wallet_rpc.z_shield_coinbase(mining_addr, &pool_address, None).await {
-                Ok(result) => {
-                    let utxos = result.get("shieldingUTXOs").and_then(|v| v.as_u64()).unwrap_or(0);
-                    if utxos > 0 {
-                        let opid = result.get("opid").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
-                        tracing::info!(opid = %opid, utxos = utxos, "Shielding triggered, waiting for 3 confirmations");
-                        shielded = true;
+    if state.coinbase_payout_mode.uses_coinbase_shielding() {
+        if let Some(ref mining_addr) = state.mining_address {
+            if *mining_addr != pool_address {
+                match wallet_rpc.z_shield_coinbase(mining_addr, &pool_address, None).await {
+                    Ok(result) => {
+                        let utxos = result.get("shieldingUTXOs").and_then(|v| v.as_u64()).unwrap_or(0);
+                        if utxos > 0 {
+                            let opid = result.get("opid").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                            tracing::info!(opid = %opid, utxos = utxos, "Shielding triggered, waiting for 3 confirmations");
+                            shielded = true;
 
-                        // Wait for the shielding operation to complete
-                        let shield_ok = loop {
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                            match wallet_rpc.z_get_operation_status(&[&opid]).await {
-                                Ok(statuses) => {
-                                    if let Some(s) = statuses.first() {
-                                        match s.get("status").and_then(|v| v.as_str()).unwrap_or("") {
-                                            "success" => break true,
-                                            "failed" => {
-                                                tracing::error!("Shielding operation failed");
-                                                break false;
+                            // Wait for the shielding operation to complete
+                            let shield_ok = loop {
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                match wallet_rpc.z_get_operation_status(&[&opid]).await {
+                                    Ok(statuses) => {
+                                        if let Some(s) = statuses.first() {
+                                            match s.get("status").and_then(|v| v.as_str()).unwrap_or("") {
+                                                "success" => break true,
+                                                "failed" => {
+                                                    tracing::error!("Shielding operation failed");
+                                                    break false;
+                                                }
+                                                _ => {}
                                             }
-                                            _ => {}
                                         }
                                     }
+                                    Err(_) => break false,
                                 }
-                                Err(_) => break false,
-                            }
-                        };
+                            };
 
-                        // Wait for 3 confirmations (~30-45s on testnet)
-                        if shield_ok {
-                            tracing::info!("Shielding complete, waiting for 3 confirmations");
-                            for _ in 0..60 {
-                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                                match wallet_rpc.call_raw::<serde_json::Value>(
-                                    "z_gettotalbalance", serde_json::json!([3, true])
-                                ).await {
-                                    Ok(bal) => {
-                                        let private = bal.get("private")
-                                            .and_then(|v| v.as_str())
-                                            .and_then(|s| s.parse::<f64>().ok())
-                                            .unwrap_or(0.0);
-                                        if private > 0.0 {
-                                            tracing::info!(balance = private, "Shielded funds confirmed (3+ confs)");
+                            // Wait for 3 confirmations (~30-45s on testnet)
+                            if shield_ok {
+                                tracing::info!("Shielding complete, waiting for 3 confirmations");
+                                for _ in 0..60 {
+                                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                    match wallet_rpc.call_raw::<serde_json::Value>(
+                                        "z_gettotalbalance", serde_json::json!([3, true])
+                                    ).await {
+                                        Ok(bal) => {
+                                            let private = bal.get("private")
+                                                .and_then(|v| v.as_str())
+                                                .and_then(|s| s.parse::<f64>().ok())
+                                                .unwrap_or(0.0);
+                                            if private > 0.0 {
+                                                tracing::info!(balance = private, "Shielded funds confirmed (3+ confs)");
+                                                break;
+                                            }
+                                        }
+                                        Err(_) => {
                                             break;
                                         }
                                     }
-                                    Err(_) => break,
                                 }
                             }
                         }
                     }
+                    Err(_) => {}
                 }
-                Err(_) => {}
             }
         }
     }

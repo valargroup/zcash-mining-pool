@@ -164,6 +164,8 @@ struct PayoutConfig {
     pool_address: Option<String>,
     #[serde(default)]
     mining_address: Option<String>,
+    #[serde(default, rename = "coinbase_mode")]
+    coinbase_payout_mode: CoinbasePayoutMode,
     #[serde(default)]
     wallet_rpc_url: Option<String>,
     #[serde(default)]
@@ -188,6 +190,7 @@ impl Default for PayoutConfig {
             enabled: false,
             pool_address: None,
             mining_address: None,
+            coinbase_payout_mode: CoinbasePayoutMode::default(),
             wallet_rpc_url: None,
             wallet_rpc_user: None,
             wallet_rpc_password: None,
@@ -195,6 +198,19 @@ impl Default for PayoutConfig {
             interval_secs: default_payout_interval(),
             maturity_confirmations: default_maturity(),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum CoinbasePayoutMode {
+    Transparent,
+    DirectShielded,
+}
+
+impl Default for CoinbasePayoutMode {
+    fn default() -> Self {
+        Self::Transparent
     }
 }
 
@@ -338,6 +354,11 @@ async fn main() -> Result<()> {
         Arc::clone(&latest_notify),
     );
     if let Some(ref tag) = config.pool.coinbase_tag {
+        if config.payout.coinbase_payout_mode == CoinbasePayoutMode::DirectShielded {
+            anyhow::bail!(
+                "pool.coinbase_tag cannot be used with payout.coinbase_mode = \"direct_shielded\"; set Zebra mining.extra_coinbase_data instead"
+            );
+        }
         info!(coinbase_tag = %tag, "Coinbase tag injection enabled");
         job_manager.set_coinbase_tag(tag.as_bytes().to_vec());
     }

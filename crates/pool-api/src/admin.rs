@@ -143,6 +143,7 @@ pub struct PoolConfigView {
     pub maturity_confirmations: u64,
     pub pool_address: Option<String>,
     pub mining_address: Option<String>,
+    pub coinbase_payout_mode: crate::handlers::CoinbasePayoutMode,
     pub node_rpc_url: String,
     pub wallet_rpc_url: Option<String>,
     pub coinbase_tag: Option<String>,
@@ -952,7 +953,7 @@ table.data tr:hover { background: rgba(244, 183, 40, 0.03); }
 <div class="panel" id="panel-payouts">
     <div class="card">
         <h2>Trigger Manual Payout</h2>
-        <p style="font-size:0.8rem;color:#718096;margin-bottom:0.75rem">Runs the full payout pipeline: check maturity, shield coinbase, send payouts.</p>
+        <p style="font-size:0.8rem;color:#718096;margin-bottom:0.75rem">Runs the full payout pipeline: check maturity, shield coinbase when configured, send payouts.</p>
         <button class="btn btn-primary" id="btn-payout" onclick="triggerPayout()">Trigger Payout</button>
         <div id="payout-status" class="status-msg"></div>
     </div>
@@ -1057,6 +1058,7 @@ async function fetchConfig() {
             ['Payout Interval', d.payout_interval_secs + 's'],
             ['Pool Address', d.pool_address || 'N/A'],
             ['Mining Address', d.mining_address || 'N/A'],
+            ['Coinbase Mode', d.coinbase_payout_mode || 'transparent'],
             ['Node RPC', d.node_rpc_url],
             ['Wallet RPC', d.wallet_rpc_url || 'N/A'],
             ['Coinbase Tag', d.coinbase_tag || 'N/A'],

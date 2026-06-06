@@ -14,8 +14,16 @@ listen_addr = "127.0.0.1:18232"
 enable_cookie_auth = false
 
 [mining]
-# Replace with your own testnet transparent address
+# For payout.coinbase_mode = "transparent", use a transparent address and set
+# payout.mining_address to the same value in pool.toml.
+#
+# For payout.coinbase_mode = "direct_shielded", use the pool unified address
+# from payout.pool_address in pool.toml. Verify the receiver type with your
+# Zebra build; this has been tested with Sapling direct coinbase.
 miner_address = "YOUR_TESTNET_ADDRESS_HERE"
+# Optional pool tag. Use this instead of pool.coinbase_tag when mining directly
+# to a shielded address.
+# extra_coinbase_data = "MyPool"
 
 [tracing]
 endpoint_addr = "127.0.0.1:3000"
