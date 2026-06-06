@@ -5,9 +5,11 @@ use crate::types::*;
 
 /// Default timeout for RPC calls so a hung node cannot stall the pool.
 const RPC_TIMEOUT: Duration = Duration::from_secs(15);
+pub const GET_BLOCK_TEMPLATE_TIMEOUT_SECS: u64 = 120;
 /// Orchard coinbase templates can take longer because Zebra constructs the
 /// shielded coinbase transaction before returning `getblocktemplate`.
-const GET_BLOCK_TEMPLATE_TIMEOUT: Duration = Duration::from_secs(120);
+pub const GET_BLOCK_TEMPLATE_TIMEOUT: Duration =
+    Duration::from_secs(GET_BLOCK_TEMPLATE_TIMEOUT_SECS);
 
 #[derive(Debug, thiserror::Error)]
 pub enum RpcError {
@@ -106,7 +108,9 @@ impl ZcashRpcClient {
     /// the template identified by `longpollid` is no longer current (new
     /// block, mempool change, etc.) and then returns the new template.
     /// Uses `timeout` as a hard cap on the HTTP request so the pool can
-    /// fall back to regular polling if the node hangs.
+    /// fall back to regular polling if the node hangs. The cap is floored
+    /// at the regular block template timeout because direct Orchard coinbase
+    /// templates can take longer than older 60s longpoll defaults.
     pub async fn get_block_template_longpoll(
         &self,
         longpollid: &str,
@@ -117,6 +121,11 @@ impl ZcashRpcClient {
             "mode": "template",
             "longpollid": longpollid,
         }]);
+        let timeout = if timeout < GET_BLOCK_TEMPLATE_TIMEOUT {
+            GET_BLOCK_TEMPLATE_TIMEOUT
+        } else {
+            timeout
+        };
         self.call_with_timeout("getblocktemplate", params, timeout).await
     }
 

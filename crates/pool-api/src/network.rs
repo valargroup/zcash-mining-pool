@@ -1,10 +1,11 @@
 use axum::extract::{Query, State};
 use axum::response::{Html, Json};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::task::JoinSet;
 
-use crate::handlers::AppState;
+use crate::handlers::{AppState, CoinbasePayoutMode};
 
 /// Number of blocks to fetch concurrently per batch.
 const CONCURRENCY: usize = 50;
@@ -143,6 +144,50 @@ fn is_zebrad_block(coinbase_hex: &str) -> bool {
     coinbase_hex.contains("f09fa693")
 }
 
+fn reverse_hex(hex_str: &str) -> String {
+    let bytes = hex::decode(hex_str).unwrap_or_default();
+    let reversed: Vec<u8> = bytes.into_iter().rev().collect();
+    hex::encode(reversed)
+}
+
+fn json_i64(value: &serde_json::Value) -> Option<i64> {
+    value.as_i64().or_else(|| value.as_str()?.parse().ok())
+}
+
+fn json_f64(value: &serde_json::Value) -> Option<f64> {
+    value.as_f64().or_else(|| value.as_str()?.parse().ok())
+}
+
+fn orchard_coinbase_reward_zec(coinbase_tx: &serde_json::Value) -> Option<f64> {
+    let orchard = coinbase_tx.get("orchard")?;
+    if let Some(zats) = orchard
+        .get("valueBalanceZat")
+        .and_then(json_i64)
+        .filter(|zats| *zats != 0)
+    {
+        return Some(zats.unsigned_abs() as f64 / 100_000_000.0);
+    }
+
+    orchard
+        .get("valueBalance")
+        .and_then(json_f64)
+        .filter(|zec| *zec != 0.0)
+        .map(f64::abs)
+}
+
+fn insert_hash_variants(set: &mut HashSet<String>, hash: &str) {
+    if hash.is_empty() {
+        return;
+    }
+
+    let hash = hash.to_ascii_lowercase();
+    set.insert(hash.clone());
+    let reversed = reverse_hex(&hash);
+    if !reversed.is_empty() {
+        set.insert(reversed);
+    }
+}
+
 /// Extract coinbase info from a block JSON (verbosity=2, full tx objects inline).
 /// Returns (miner_address, reward_zec, coinbase_text, coinbase_hex).
 /// Returns (miner_address, reward_zec, coinbase_text, coinbase_hex, coinbase_tx_version).
@@ -182,7 +227,16 @@ fn extract_coinbase_from_block(block_data: &serde_json::Value) -> (String, f64, 
     // Extract miner address and reward from vout[0]
     let vout = match coinbase_tx.get("vout").and_then(|v| v.as_array()) {
         Some(arr) if !arr.is_empty() => arr,
-        _ => return ("unknown".to_string(), 0.0, coinbase_text, coinbase_hex, coinbase_tx_version),
+        _ => {
+            let reward_zec = orchard_coinbase_reward_zec(coinbase_tx).unwrap_or(0.0);
+            return (
+                "unknown".to_string(),
+                reward_zec,
+                coinbase_text,
+                coinbase_hex,
+                coinbase_tx_version,
+            );
+        }
     };
 
     let first_vout = &vout[0];
@@ -225,6 +279,28 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
     let start_height = (tip).saturating_sub(scan_count).max(1);
 
     let our_mining_address = state.mining_address.clone().unwrap_or_default();
+    let direct_shielded_mode = state.coinbase_payout_mode == CoinbasePayoutMode::DirectShielded;
+
+    let mut direct_pool_block_hashes = HashSet::new();
+    let mut direct_pool_block_heights = HashSet::new();
+    if direct_shielded_mode {
+        match state.db.get_non_orphan_blocks_between(start_height as i64, tip as i64).await {
+            Ok(blocks) => {
+                for block in blocks {
+                    insert_hash_variants(&mut direct_pool_block_hashes, &block.hash);
+                    if block.height >= 0 {
+                        direct_pool_block_heights.insert(block.height as u64);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to load local pool blocks for direct shielded network stats"
+                );
+            }
+        }
+    }
 
     // Collect heights to fetch (newest first).
     let heights: Vec<u64> = (start_height..=tip).rev().collect();
@@ -277,9 +353,23 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let (miner_address, reward_zec, coinbase_text, coinbase_hex, coinbase_tx_version) = extract_coinbase_from_block(block_data);
+        let (mut miner_address, reward_zec, coinbase_text, coinbase_hex, coinbase_tx_version) =
+            extract_coinbase_from_block(block_data);
 
-        let is_our_pool = !our_mining_address.is_empty() && miner_address == our_mining_address;
+        let direct_pool_hash_match =
+            direct_shielded_mode && direct_pool_block_hashes.contains(&hash.to_ascii_lowercase());
+        let direct_pool_height_fallback =
+            direct_shielded_mode && hash.is_empty() && direct_pool_block_heights.contains(height);
+        let is_recorded_direct_pool_block = direct_pool_hash_match || direct_pool_height_fallback;
+        if is_recorded_direct_pool_block
+            && miner_address == "unknown"
+            && !our_mining_address.is_empty()
+        {
+            miner_address = our_mining_address.clone();
+        }
+
+        let is_our_pool = (!our_mining_address.is_empty() && miner_address == our_mining_address)
+            || is_recorded_direct_pool_block;
         let pool_name = if is_our_pool {
             Some("Our Pool".to_string())
         } else {
@@ -306,9 +396,11 @@ async fn fetch_network_blocks(state: &AppState, range: &str) -> Result<NetworkMi
 
     // Build distribution.
     // Track (block_count, zebrad_count, tx_version_counts) per address.
-    let mut addr_stats: std::collections::HashMap<String, (u64, u64, std::collections::HashMap<i32, u64>)> = std::collections::HashMap::new();
+    let mut addr_stats: HashMap<String, (u64, u64, HashMap<i32, u64>)> = HashMap::new();
     for b in &blocks {
-        let entry = addr_stats.entry(b.miner_address.clone()).or_insert((0, 0, std::collections::HashMap::new()));
+        let entry = addr_stats
+            .entry(b.miner_address.clone())
+            .or_insert((0, 0, HashMap::new()));
         entry.0 += 1;
         if b.is_zebrad {
             entry.1 += 1;

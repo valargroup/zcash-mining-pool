@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use node_rpc::ZcashRpcClient;
+use node_rpc::{ZcashRpcClient, GET_BLOCK_TEMPLATE_TIMEOUT_SECS};
 use pool_core::{BlockAssembler, JobManager, ShareValidator, VardiffConfig};
 use pool_db::PoolDb;
 use rewards::PplnsCalculator;
@@ -147,7 +147,7 @@ struct DifficultyConfig {
 }
 
 fn default_longpoll_timeout_secs() -> u64 {
-    60
+    GET_BLOCK_TEMPLATE_TIMEOUT_SECS
 }
 
 #[derive(Debug, Deserialize)]
@@ -364,7 +364,9 @@ async fn main() -> Result<()> {
     }
     job_manager.set_longpoll_config(pool_core::job::LongpollConfig {
         enabled: config.difficulty.use_longpoll,
-        timeout: Duration::from_secs(config.difficulty.longpoll_timeout_secs),
+        timeout: Duration::from_secs(
+            config.difficulty.longpoll_timeout_secs.max(GET_BLOCK_TEMPLATE_TIMEOUT_SECS),
+        ),
     });
     let jobs = job_manager.jobs();
 

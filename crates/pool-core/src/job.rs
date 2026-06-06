@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use node_rpc::types::BlockTemplate;
-use node_rpc::ZcashRpcClient;
+use node_rpc::{ZcashRpcClient, GET_BLOCK_TEMPLATE_TIMEOUT};
 use sha2::{Digest, Sha256};
 use stratum::server::StratumServer;
 use stratum::ServerMessage;
@@ -100,7 +100,7 @@ pub struct LongpollConfig {
 
 impl Default for LongpollConfig {
     fn default() -> Self {
-        Self { enabled: false, timeout: Duration::from_secs(60) }
+        Self { enabled: false, timeout: GET_BLOCK_TEMPLATE_TIMEOUT }
     }
 }
 

@@ -258,6 +258,26 @@ impl PoolDb {
         Ok(blocks)
     }
 
+    /// Get non-orphan blocks in an inclusive height range.
+    pub async fn get_non_orphan_blocks_between(
+        &self,
+        min_height: i64,
+        max_height: i64,
+    ) -> Result<Vec<Block>, DbError> {
+        let blocks: Vec<Block> = sqlx::query_as(
+            "SELECT id, height, hash, reward, status, found_by, created_at, luck_percent \
+             FROM blocks \
+             WHERE height >= ?1 AND height <= ?2 AND status != 'orphaned' \
+             ORDER BY height ASC",
+        )
+        .bind(min_height)
+        .bind(max_height)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(blocks)
+    }
+
     /// Count shares submitted between two timestamps.
     pub async fn get_shares_count_between(&self, from: &str, to: &str) -> Result<i64, DbError> {
         let row: (i64,) = sqlx::query_as(

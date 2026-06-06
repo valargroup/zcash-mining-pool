@@ -43,7 +43,7 @@ retarget_interval_secs = 30
 # instead of relying on the 500ms polling loop. Falls back to regular
 # polling on errors. Default: false (use regular polling).
 # use_longpoll = true
-# longpoll_timeout_secs = 60
+# longpoll_timeout_secs = 120
 
 # PPLNS settings require a pool restart.
 [pplns]
