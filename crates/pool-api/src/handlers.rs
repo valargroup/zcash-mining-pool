@@ -12,7 +12,11 @@ use pool_db::PoolDb;
 pub type AppState = Arc<ApiState>;
 
 /// If no template received in this many ms, the pool is considered stalled.
-const STALL_THRESHOLD_MS: i64 = 90_000;
+///
+/// This must exceed the node RPC `getblocktemplate` timeout. Direct Orchard
+/// coinbase templates can legitimately spend up to 120s in Zebra proof
+/// generation before `last_template_at_ms` is refreshed.
+const STALL_THRESHOLD_MS: i64 = 180_000;
 
 /// Zcash target block interval.
 const BLOCK_TIME_SECS: f64 = 75.0;
