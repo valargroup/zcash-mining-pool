@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use crate::select_payable_payouts;
 use pool_db::PoolDb;
 
 pub type AppState = Arc<ApiState>;
@@ -726,10 +727,32 @@ pub async fn trigger_payout(
         })));
     }
 
-    let amounts: Vec<(&str, f64)> = pending
+    let (payable, selection_stats) = select_payable_payouts(
+        &pending,
+        state.mining_address.as_deref(),
+        state.coinbase_payout_mode,
+        &state.network,
+    );
+
+    if payable.is_empty() {
+        return (StatusCode::OK, Json(serde_json::json!({
+            "status": "ok",
+            "message": "No payable miners after filtering",
+            "blocks_confirmed": confirmed,
+            "blocks_orphaned": orphaned,
+            "shielding_triggered": shielded,
+            "payouts": 0,
+            "held_invalid": selection_stats.held_invalid,
+            "skipped_invalid": selection_stats.skipped_invalid,
+            "redirected": selection_stats.redirected,
+        })));
+    }
+
+    let amounts: Vec<(&str, f64)> = payable
         .iter()
-        .map(|p| (p.address.as_str(), p.amount as f64 / ZATOSHIS_PER_ZEC_F64))
+        .map(|p| (p.pay_to.as_str(), p.amount_zatoshis as f64 / ZATOSHIS_PER_ZEC_F64))
         .collect();
+    let total_zatoshis: i64 = payable.iter().map(|p| p.amount_zatoshis).sum();
 
     let opid = match wallet_rpc.z_sendmany(&pool_address, &amounts).await {
         Ok(id) => id,
@@ -745,11 +768,14 @@ pub async fn trigger_payout(
         "status": "ok",
         "message": "Payout submitted",
         "opid": opid,
-        "miners": pending.len(),
-        "total_zec": pending.iter().map(|p| p.amount).sum::<i64>() as f64 / ZATOSHIS_PER_ZEC_F64,
+        "miners": payable.len(),
+        "total_zec": total_zatoshis as f64 / ZATOSHIS_PER_ZEC_F64,
         "blocks_confirmed": confirmed,
         "blocks_orphaned": orphaned,
         "shielding_triggered": shielded,
+        "held_invalid": selection_stats.held_invalid,
+        "skipped_invalid": selection_stats.skipped_invalid,
+        "redirected": selection_stats.redirected,
     })))
 }
 

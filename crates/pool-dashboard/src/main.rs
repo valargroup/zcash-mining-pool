@@ -3,14 +3,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use chrono::Utc;
 use serde::Deserialize;
 use sqlx::sqlite::SqlitePoolOptions;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use node_rpc::ZcashRpcClient;
-use pool_api::{ApiState, AppState, CoinbasePayoutMode};
+use pool_api::{select_payable_payouts, ApiState, AppState, CoinbasePayoutMode};
 use pool_db::PoolDb;
 
 const ZATOSHIS_PER_ZEC: f64 = 100_000_000.0;
@@ -942,7 +941,23 @@ async fn process_payouts(
         return Ok(0);
     }
 
-    let total_payout_zatoshis: i64 = pending.iter().map(|p| p.amount).sum();
+    let (payable, selection_stats) = select_payable_payouts(
+        &pending,
+        Some(mining_address),
+        coinbase_payout_mode,
+        network,
+    );
+    if payable.is_empty() {
+        info!(
+            held_invalid = selection_stats.held_invalid,
+            skipped_invalid = selection_stats.skipped_invalid,
+            redirected = selection_stats.redirected,
+            "No payable payouts after filtering"
+        );
+        return Ok(0);
+    }
+
+    let total_payout_zatoshis: i64 = payable.iter().map(|p| p.amount_zatoshis).sum();
     let total_payout_zec = total_payout_zatoshis as f64 / ZATOSHIS_PER_ZEC;
 
     let private_balance = match rpc.call_raw::<serde_json::Value>(
@@ -969,37 +984,10 @@ async fn process_payouts(
     let scale = if available_zec >= total_payout_zec { 1.0 } else { available_zec / total_payout_zec };
 
     let mut payout_list: Vec<(usize, i64, String)> = Vec::new();
-    let two_days_ago = Utc::now()
-        .checked_sub_signed(chrono::Duration::days(2))
-        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
-        .unwrap_or_default();
-
-    for (i, p) in pending.iter().enumerate() {
-        let pay_to = if is_valid_zcash_address(&p.address, network) {
-            p.address.clone()
-        } else if p.created_at <= two_days_ago {
-            if coinbase_payout_mode == CoinbasePayoutMode::DirectShielded {
-                warn!(
-                    miner_id = p.miner_id, address = %p.address, created_at = %p.created_at,
-                    amount_zec = p.amount as f64 / ZATOSHIS_PER_ZEC,
-                    "Holding payout: invalid address format (direct shielded mode has no non-source fallback)"
-                );
-                continue;
-            }
-            warn!(
-                miner_id = p.miner_id, address = %p.address, created_at = %p.created_at,
-                amount_zec = p.amount as f64 / ZATOSHIS_PER_ZEC,
-                "Redirecting payout to mining address (unpayable address, >2 days old)"
-            );
-            mining_address.to_string()
-        } else {
-            warn!(miner_id = p.miner_id, address = %p.address,
-                "Skipping payout: invalid address format (account < 2 days old)");
-            continue;
-        };
-        let scaled_zatoshis = (p.amount as f64 * scale).floor() as i64;
+    for p in payable {
+        let scaled_zatoshis = (p.amount_zatoshis as f64 * scale).floor() as i64;
         if scaled_zatoshis >= min_payout_zatoshis {
-            payout_list.push((i, scaled_zatoshis, pay_to));
+            payout_list.push((p.pending_index, scaled_zatoshis, p.pay_to));
         }
     }
 
@@ -1010,7 +998,16 @@ async fn process_payouts(
 
     let actual_total_zatoshis: i64 = payout_list.iter().map(|(_, amt, _)| *amt).sum();
     let actual_total_zec = actual_total_zatoshis as f64 / ZATOSHIS_PER_ZEC;
-    info!(miners = payout_list.len(), total_zec = actual_total_zec, private_balance, scale, "Processing payouts");
+    info!(
+        miners = payout_list.len(),
+        total_zec = actual_total_zec,
+        private_balance,
+        scale,
+        held_invalid = selection_stats.held_invalid,
+        skipped_invalid = selection_stats.skipped_invalid,
+        redirected = selection_stats.redirected,
+        "Processing payouts"
+    );
 
     let (opid, payout_list) = {
         let mut current_list = payout_list;
@@ -1105,80 +1102,4 @@ fn parse_have_balance(msg: &str) -> Option<i64> {
     let rest = &msg[start..];
     let end = rest.find(|c: char| !c.is_ascii_digit())?;
     rest[..end].parse::<i64>().ok()
-}
-
-/// Validates a Zcash address for the given network using proper encoding checks.
-///
-/// Transparent addresses (t1/t3/tm/t2) use base58check encoding with specific
-/// version bytes. Sapling (zs/ztestsapling) and unified (u1/utest) addresses
-/// use bech32/bech32m encoding with specific HRP and length constraints.
-fn is_valid_zcash_address(addr: &str, network: &str) -> bool {
-    let is_mainnet = network == "mainnet";
-
-    // Transparent addresses: base58check with 2-byte version prefix.
-    // Mainnet: t1 (P2PKH, version 0x1CB8), t3 (P2SH, version 0x1CBD)
-    // Testnet: tm (P2PKH, version 0x1D25), t2 (P2SH, version 0x1CBA)
-    if addr.starts_with('t') {
-        // Quick prefix check for the right network
-        let valid_prefix = if is_mainnet {
-            addr.starts_with("t1") || addr.starts_with("t3")
-        } else {
-            addr.starts_with("tm") || addr.starts_with("t2")
-        };
-        if !valid_prefix {
-            return false;
-        }
-        // Base58check decode: should produce exactly 22 bytes (2 version + 20 hash)
-        return match bs58::decode(addr).with_check(None).into_vec() {
-            Ok(bytes) => bytes.len() == 22,
-            Err(_) => false,
-        };
-    }
-
-    // Sapling addresses: bech32 encoding
-    // Mainnet: "zs1" HRP, 78 chars total (43 byte payload)
-    // Testnet: "ztestsapling1" HRP, 88 chars total
-    if addr.starts_with('z') {
-        let valid_prefix = if is_mainnet {
-            addr.starts_with("zs1")
-        } else {
-            addr.starts_with("ztestsapling1")
-        };
-        if !valid_prefix {
-            return false;
-        }
-        // bech32 charset: lowercase alphanumeric excluding 1, b, i, o
-        let hrp_end = addr.rfind('1').unwrap_or(0);
-        let data_part = &addr[hrp_end + 1..];
-        let valid_charset = data_part
-            .chars()
-            .all(|c| "qpzry9x8gf2tvdw0s3jn54khce6mua7l".contains(c));
-        let expected_len = if is_mainnet { 78 } else { 88 };
-        return valid_charset && addr.len() == expected_len;
-    }
-
-    // Unified addresses: bech32m encoding
-    // Mainnet: "u1" HRP
-    // Testnet: "utest1" HRP
-    if addr.starts_with('u') {
-        let valid_prefix = if is_mainnet {
-            addr.starts_with("u1") && !addr.starts_with("utest")
-        } else {
-            addr.starts_with("utest1")
-        };
-        if !valid_prefix {
-            return false;
-        }
-        // Unified addresses vary in length depending on which receivers are
-        // included (transparent, sapling, orchard). Minimum is ~62 chars for
-        // a single-receiver UA, maximum ~320 for all three receivers.
-        let hrp_end = addr.find('1').unwrap_or(0);
-        let data_part = &addr[hrp_end + 1..];
-        let valid_charset = data_part
-            .chars()
-            .all(|c| "qpzry9x8gf2tvdw0s3jn54khce6mua7l".contains(c));
-        return valid_charset && data_part.len() >= 50 && addr.len() <= 320;
-    }
-
-    false
 }

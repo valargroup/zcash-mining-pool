@@ -1397,6 +1397,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "blake2b_simd",
+ "bs58",
  "chrono",
  "hex",
  "libc",
@@ -1441,7 +1442,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "bs58",
  "chrono",
  "hex",
  "node-rpc",
