@@ -6,18 +6,68 @@ use tracing::debug;
 pub struct InjectionResult {
     /// The modified coinbase transaction hex.
     pub new_coinbase_hex: String,
-    /// For v4: new txid (SHA256d of full tx). None for v5.
+    /// For v4: new txid (SHA256d of full tx). None for v5/v6.
     pub new_txid: Option<String>,
-    /// For v5: new hashBlockCommitments (in RPC display byte order). None for v4.
+    /// For v5/v6: new hashBlockCommitments in RPC display byte order.
+    /// None for v4.
     pub new_block_commitments: Option<String>,
 }
 
 /// Maximum scriptSig length we allow after tag injection.
 const MAX_SCRIPT_SIG_LEN: usize = 100;
 
+const V4_HEADER: [u8; 4] = [0x04, 0x00, 0x00, 0x80];
+const V5_HEADER: [u8; 4] = [0x05, 0x00, 0x00, 0x80];
+const V6_HEADER: [u8; 4] = [0x06, 0x00, 0x00, 0x80];
+
+const ZCASH_BLOCK_COMMIT_PERSONALIZATION: &[u8; 16] = b"ZcashBlockCommit";
+const ZCASH_AUTH_DATA_PERSONALIZATION: &[u8; 16] = b"ZcashAuthDatHash";
+const ZCASH_AUTH_PERSONALIZATION_PREFIX: &[u8; 12] = b"ZTxAuthHash_";
+const ZCASH_TRANSPARENT_AUTH_PERSONALIZATION: &[u8; 16] = b"ZTxAuthTransHash";
+const ZCASH_SAPLING_AUTH_PERSONALIZATION: &[u8; 16] = b"ZTxAuthSapliHash";
+const ZCASH_SAPLING_V6_AUTH_PERSONALIZATION: &[u8; 16] = b"ZTxAuthSapliH_v6";
+const ZCASH_ORCHARD_AUTH_PERSONALIZATION: &[u8; 16] = b"ZTxAuthOrchaHash";
+const ZCASH_ORCHARD_V6_AUTH_PERSONALIZATION: &[u8; 16] = b"ZTxAuthOrchaH_v6";
+const ZCASH_IRONWOOD_AUTH_PERSONALIZATION: &[u8; 16] = b"ZTxAuthIrnwdH_v6";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TxVersion {
+    V4,
+    V5,
+    V6,
+}
+
+impl TxVersion {
+    fn from_header(header: &[u8]) -> Result<Self, String> {
+        if header == V4_HEADER {
+            Ok(Self::V4)
+        } else if header == V5_HEADER {
+            Ok(Self::V5)
+        } else if header == V6_HEADER {
+            Ok(Self::V6)
+        } else {
+            Err(format!(
+                "Unknown tx version: {:02x}{:02x}{:02x}{:02x}",
+                header[0], header[1], header[2], header[3]
+            ))
+        }
+    }
+
+    fn header_len(self) -> usize {
+        match self {
+            Self::V4 => 8,
+            Self::V5 | Self::V6 => 20,
+        }
+    }
+
+    fn has_zip244_auth(self) -> bool {
+        matches!(self, Self::V5 | Self::V6)
+    }
+}
+
 /// Inject a tag into the coinbase transaction's scriptSig.
 ///
-/// For v5 transactions, recomputes the auth digest chain and returns
+/// For v5/v6 transactions, recomputes the auth digest chain and returns
 /// a new `hashBlockCommitments`. The `tx_auth_digests` parameter must
 /// contain the auth digests (hex, RPC byte order) of all non-coinbase
 /// transactions in block order (from zebrad's `authdigest` field).
@@ -31,28 +81,19 @@ pub fn inject_coinbase_tag(
     chain_history_root_hex: &str,
     tx_auth_digests: &[String],
 ) -> Result<InjectionResult, String> {
-    let data = hex::decode(coinbase_hex)
-        .map_err(|e| format!("Invalid coinbase hex: {e}"))?;
+    let data = hex::decode(coinbase_hex).map_err(|e| format!("Invalid coinbase hex: {e}"))?;
 
     if data.len() < 4 {
         return Err("Coinbase too short".into());
     }
 
-    // Detect version: v5 = 05000080, v4 = 04000080
-    let is_v5 = data[0..4] == [0x05, 0x00, 0x00, 0x80];
-    let is_v4 = data[0..4] == [0x04, 0x00, 0x00, 0x80];
-
-    if !is_v5 && !is_v4 {
-        return Err(format!(
-            "Unknown tx version: {:02x}{:02x}{:02x}{:02x}",
-            data[0], data[1], data[2], data[3]
-        ));
-    }
+    let version = TxVersion::from_header(&data[0..4])?;
 
     // Skip header to reach tx_in_count
-    // v5: version(4) + version_group_id(4) + consensus_branch_id(4) + lock_time(4) + expiry_height(4) = 20
+    // v5/v6: version(4) + version_group_id(4) + consensus_branch_id(4)
+    //        + lock_time(4) + expiry_height(4) = 20
     // v4: version(4) + version_group_id(4) = 8
-    let header_len = if is_v5 { 20 } else { 8 };
+    let header_len = version.header_len();
 
     if data.len() < header_len + 1 {
         return Err("Coinbase too short for header".into());
@@ -116,12 +157,13 @@ pub fn inject_coinbase_tag(
     new_data.extend_from_slice(&new_script_sig);
     new_data.extend_from_slice(&data[script_sig_end..]);
 
-    if is_v5 {
+    if version.has_zip244_auth() {
         // Extract consensus_branch_id from coinbase bytes 8-11
         let consensus_branch_id = &data[8..12];
 
         // Compute new coinbase auth_digest (internal byte order)
-        let coinbase_auth = compute_coinbase_auth_digest(consensus_branch_id, new_cs, &new_script_sig);
+        let coinbase_auth =
+            compute_coinbase_auth_digest(consensus_branch_id, version, new_cs, &new_script_sig);
 
         // Parse non-coinbase tx auth digests from template.
         // Zebrad returns auth digests in RPC byte order (reversed); we need internal order.
@@ -131,7 +173,10 @@ pub fn inject_coinbase_tag(
             let ad_bytes = hex::decode(ad_hex)
                 .map_err(|e| format!("Invalid authdigest hex for tx {i}: {e}"))?;
             if ad_bytes.len() != 32 {
-                return Err(format!("authdigest for tx {i} is {} bytes, expected 32", ad_bytes.len()));
+                return Err(format!(
+                    "authdigest for tx {i} is {} bytes, expected 32",
+                    ad_bytes.len()
+                ));
             }
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&ad_bytes);
@@ -158,7 +203,7 @@ pub fn inject_coinbase_tag(
         commit_input[..32].copy_from_slice(&chain_history_root);
         commit_input[32..64].copy_from_slice(&auth_data_root);
         // commit_input[64..96] already zero (terminator)
-        let mut block_commitments = blake2b_256(b"ZcashBlockCommit", &commit_input);
+        let mut block_commitments = blake2b_256(ZCASH_BLOCK_COMMIT_PERSONALIZATION, &commit_input);
         block_commitments.reverse(); // internal order → RPC order
 
         Ok(InjectionResult {
@@ -183,10 +228,10 @@ pub fn inject_coinbase_tag(
 ///
 /// Returns the auth_digest in INTERNAL byte order (not RPC display order).
 ///
-/// For coinbase: sapling auth = BLAKE2b("ZTxAuthSapliHash", empty),
-/// orchard auth = BLAKE2b("ZTxAuthOrchaHash", empty). These are NOT [0;32].
+/// Empty bundle auth digests are version-specific BLAKE2b hashes, not `[0;32]`.
 fn compute_coinbase_auth_digest(
     consensus_branch_id: &[u8],
+    version: TxVersion,
     script_sig_cs: u8,
     new_script_sig: &[u8],
 ) -> [u8; 32] {
@@ -194,22 +239,45 @@ fn compute_coinbase_auth_digest(
     let mut scripts_input = Vec::with_capacity(1 + new_script_sig.len());
     scripts_input.push(script_sig_cs);
     scripts_input.extend_from_slice(new_script_sig);
-    let transparent_scripts_digest = blake2b_256(b"ZTxAuthTransHash", &scripts_input);
+    let transparent_scripts_digest =
+        blake2b_256(ZCASH_TRANSPARENT_AUTH_PERSONALIZATION, &scripts_input);
 
-    // Coinbase has no sapling/orchard bundles, but the auth digests are NOT zero —
-    // they are the BLAKE2b hash of empty data with their respective personalizations.
-    let sapling_auth_digest = blake2b_256(b"ZTxAuthSapliHash", &[]);
-    let orchard_auth_digest = blake2b_256(b"ZTxAuthOrchaHash", &[]);
+    // Coinbase has no shielded bundles, but the auth digests are NOT zero.
+    // They are BLAKE2b hashes of empty data with versioned personalizations.
+    let (sapling_personal, orchard_personal) = match version {
+        TxVersion::V4 => unreachable!("v4 transactions do not have ZIP-244 auth digests"),
+        TxVersion::V5 => (
+            ZCASH_SAPLING_AUTH_PERSONALIZATION.as_slice(),
+            ZCASH_ORCHARD_AUTH_PERSONALIZATION.as_slice(),
+        ),
+        TxVersion::V6 => (
+            ZCASH_SAPLING_V6_AUTH_PERSONALIZATION.as_slice(),
+            ZCASH_ORCHARD_V6_AUTH_PERSONALIZATION.as_slice(),
+        ),
+    };
+    let sapling_auth_digest = blake2b_256(sapling_personal, &[]);
+    let orchard_auth_digest = blake2b_256(orchard_personal, &[]);
+    let ironwood_auth_digest =
+        (version == TxVersion::V6).then(|| blake2b_256(ZCASH_IRONWOOD_AUTH_PERSONALIZATION, &[]));
 
-    // auth_digest = BLAKE2b("ZTxAuthHash_" || branch_id, transparent || sapling || orchard)
+    // auth_digest = BLAKE2b("ZTxAuthHash_" || branch_id,
+    //                       transparent || sapling || orchard [|| ironwood])
     let mut auth_perso = [0u8; 16];
-    auth_perso[..12].copy_from_slice(b"ZTxAuthHash_");
+    auth_perso[..12].copy_from_slice(ZCASH_AUTH_PERSONALIZATION_PREFIX);
     auth_perso[12..16].copy_from_slice(consensus_branch_id);
 
-    let mut auth_input = [0u8; 96];
-    auth_input[..32].copy_from_slice(&transparent_scripts_digest);
-    auth_input[32..64].copy_from_slice(&sapling_auth_digest);
-    auth_input[64..96].copy_from_slice(&orchard_auth_digest);
+    let auth_input_len = if ironwood_auth_digest.is_some() {
+        128
+    } else {
+        96
+    };
+    let mut auth_input = Vec::with_capacity(auth_input_len);
+    auth_input.extend_from_slice(&transparent_scripts_digest);
+    auth_input.extend_from_slice(&sapling_auth_digest);
+    auth_input.extend_from_slice(&orchard_auth_digest);
+    if let Some(ironwood_auth_digest) = ironwood_auth_digest {
+        auth_input.extend_from_slice(&ironwood_auth_digest);
+    }
     blake2b_256(&auth_perso, &auth_input)
 }
 
@@ -238,7 +306,7 @@ fn auth_data_merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
             let mut input = [0u8; 64];
             input[..32].copy_from_slice(&pair[0]);
             input[32..64].copy_from_slice(&pair[1]);
-            next.push(blake2b_256(b"ZcashAuthDatHash", &input));
+            next.push(blake2b_256(ZCASH_AUTH_DATA_PERSONALIZATION, &input));
         }
         current = next;
     }
@@ -355,7 +423,7 @@ mod tests {
         let mut expected_input = [0u8; 64];
         expected_input[..32].copy_from_slice(&leaf0);
         expected_input[32..64].copy_from_slice(&leaf1);
-        let expected = blake2b_256(b"ZcashAuthDatHash", &expected_input);
+        let expected = blake2b_256(ZCASH_AUTH_DATA_PERSONALIZATION, &expected_input);
         assert_eq!(root, expected);
     }
 
@@ -369,16 +437,16 @@ mod tests {
         let mut input01 = [0u8; 64];
         input01[..32].copy_from_slice(&l0);
         input01[32..64].copy_from_slice(&l1);
-        let h01 = blake2b_256(b"ZcashAuthDatHash", &input01);
+        let h01 = blake2b_256(ZCASH_AUTH_DATA_PERSONALIZATION, &input01);
 
         let mut input2z = [0u8; 64];
         input2z[..32].copy_from_slice(&l2);
-        let h2z = blake2b_256(b"ZcashAuthDatHash", &input2z);
+        let h2z = blake2b_256(ZCASH_AUTH_DATA_PERSONALIZATION, &input2z);
 
         let mut input_top = [0u8; 64];
         input_top[..32].copy_from_slice(&h01);
         input_top[32..64].copy_from_slice(&h2z);
-        let expected = blake2b_256(b"ZcashAuthDatHash", &input_top);
+        let expected = blake2b_256(ZCASH_AUTH_DATA_PERSONALIZATION, &input_top);
 
         assert_eq!(root, expected);
     }
@@ -391,8 +459,10 @@ mod tests {
         let coinbase_hex = "050000800a27a726f04dec4d00000000868d3b00010000000000000000000000000000000000000000000000000000000000000000ffffffff0903868d3b7af09fa693000000000240597307000000001976a9143f1d707eae9297983695aa5dbf983e03b638530c88ac20bcbe000000000017a9147a86d6c7eb12ce0aa309d7391a6f338eba3c242b87000000";
         let chain_history_root = "15a4875bc1c8555d4f9ee74798d796c5a39ad6934d5096048cd9653442822a2e";
         // zebrad's authdigest and blockcommitmentshash are in RPC byte order (reversed)
-        let expected_authdigest_rpc = "31ffddbecc7bc45a3d182f52ed356128b96be69ddff221f18d8959a3b5cd20df";
-        let expected_blockcommitments_rpc = "782c59d40904570b53ee60d13f89597f0c942d78a364e147b61c33b996dcfd62";
+        let expected_authdigest_rpc =
+            "31ffddbecc7bc45a3d182f52ed356128b96be69ddff221f18d8959a3b5cd20df";
+        let expected_blockcommitments_rpc =
+            "782c59d40904570b53ee60d13f89597f0c942d78a364e147b61c33b996dcfd62";
 
         let data = hex::decode(coinbase_hex).unwrap();
         let consensus_branch_id = &data[8..12]; // f04dec4d
@@ -407,7 +477,12 @@ mod tests {
         let script_sig_cs = script_sig_len as u8;
 
         // Verify coinbase auth_digest (internal order, reversed = RPC order)
-        let auth = compute_coinbase_auth_digest(consensus_branch_id, script_sig_cs, script_sig);
+        let auth = compute_coinbase_auth_digest(
+            consensus_branch_id,
+            TxVersion::V5,
+            script_sig_cs,
+            script_sig,
+        );
         let auth_rpc: Vec<u8> = auth.iter().rev().copied().collect();
         assert_eq!(hex::encode(&auth_rpc), expected_authdigest_rpc);
 
@@ -421,8 +496,44 @@ mod tests {
         let mut commit_input = [0u8; 96];
         commit_input[..32].copy_from_slice(&chr);
         commit_input[32..64].copy_from_slice(&root);
-        let mut bc = blake2b_256(b"ZcashBlockCommit", &commit_input);
+        let mut bc = blake2b_256(ZCASH_BLOCK_COMMIT_PERSONALIZATION, &commit_input);
         bc.reverse(); // internal → RPC
         assert_eq!(hex::encode(bc), expected_blockcommitments_rpc);
+    }
+
+    #[test]
+    fn v6_coinbase_tag_updates_block_commitments() {
+        // v6 uses the same transparent coinbase layout position as v5, but
+        // has a different version group ID and NU6.3 consensus branch ID.
+        let coinbase_hex = "0600008098b684d85b16a53700000000868d3b00010000000000000000000000000000000000000000000000000000000000000000ffffffff0903868d3b7af09fa693000000000240597307000000001976a9143f1d707eae9297983695aa5dbf983e03b638530c88ac20bcbe000000000017a9147a86d6c7eb12ce0aa309d7391a6f338eba3c242b8700000000";
+        let chain_history_root = "15a4875bc1c8555d4f9ee74798d796c5a39ad6934d5096048cd9653442822a2e";
+        let result = inject_coinbase_tag(coinbase_hex, b"zkclaudecoder", chain_history_root, &[])
+            .expect("v6 coinbase tag injection succeeds");
+
+        assert!(result.new_txid.is_none());
+        assert!(result
+            .new_coinbase_hex
+            .contains("7af09fa6937a6b636c61756465636f646572"));
+        assert_eq!(
+            result.new_block_commitments.as_deref(),
+            Some("1dcafaa83b1a39a9f4c5eedd070b48184ddc651668fed3ced77c97ec8941a1cb")
+        );
+    }
+
+    #[test]
+    fn v6_coinbase_auth_digest_uses_v6_empty_bundle_hashes() {
+        let script_sig = hex::decode("03868d3b7af09fa6937a6b636c61756465636f646572").unwrap();
+        let auth = compute_coinbase_auth_digest(
+            &0x37a5165b_u32.to_le_bytes(),
+            TxVersion::V6,
+            script_sig.len() as u8,
+            &script_sig,
+        );
+        let auth_rpc: Vec<u8> = auth.iter().rev().copied().collect();
+
+        assert_eq!(
+            hex::encode(auth_rpc),
+            "d93bc7c4bfa13ea7a88cb3b52f35b516280eb17eba227f9d575091301bcc1da1"
+        );
     }
 }
